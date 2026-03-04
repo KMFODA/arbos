@@ -168,6 +168,7 @@ def run_agent(cmd: list[str], phase: str, output_file: Path) -> subprocess.Compl
                 f"  out={usage.get('outputTokens', '?')}"
             )
 
+    stderr_output = proc.stderr.read() if proc.stderr else ""
     returncode = proc.wait()
     elapsed = time.monotonic() - t0
     output_file.write_text("".join(raw_lines))
@@ -176,10 +177,13 @@ def run_agent(cmd: list[str], phase: str, output_file: Path) -> subprocess.Compl
         ok(f"{phase} finished  rc={returncode}  {fmt_duration(elapsed)}")
     else:
         err(f"{phase} finished  rc={returncode}  {fmt_duration(elapsed)}")
+        if stderr_output.strip():
+            for sline in stderr_output.strip().splitlines()[:20]:
+                err(f"  stderr: {sline}")
 
     return subprocess.CompletedProcess(
         args=cmd, returncode=returncode,
-        stdout=result_text, stderr="",
+        stdout=result_text, stderr=stderr_output,
     )
 
 
@@ -190,7 +194,7 @@ def extract_text(result: subprocess.CompletedProcess) -> str:
     return output
 
 
-def run_step(prompt: str) -> None:
+def run_step(prompt: str) -> bool:
     global _log_fh
 
     run_dir = make_run_dir()
@@ -222,7 +226,7 @@ def run_step(prompt: str) -> None:
         err(f"Plan phase exited with code {plan_result.returncode} — skipping execution")
         _log_fh.close()
         _log_fh = None
-        return
+        return False
 
     # ── Execute ──
     header("Execution")
@@ -245,7 +249,8 @@ def run_step(prompt: str) -> None:
     ok(f"Rollout saved → {run_dir / 'rollout.md'} ({len(exec_text)} chars)")
 
     elapsed = time.monotonic() - t0
-    if exec_result.returncode != 0:
+    success = exec_result.returncode == 0
+    if not success:
         err(f"Execution phase exited with code {exec_result.returncode}")
     else:
         ok("Run completed successfully")
@@ -254,6 +259,7 @@ def run_step(prompt: str) -> None:
 
     _log_fh.close()
     _log_fh = None
+    return success
 
 
 def main() -> None:
@@ -265,12 +271,20 @@ def main() -> None:
     dim(f"history  {HISTORY_DIR}")
 
     loop_count = 0
+    consecutive_failures = 0
     while True:
         loop_count += 1
         prompt = load_prompt()
         header(f"Iteration {loop_count}")
         dim(f"prompt={len(prompt)} chars")
-        run_step(prompt)
+        success = run_step(prompt)
+        if success:
+            consecutive_failures = 0
+        else:
+            consecutive_failures += 1
+            delay = min(2 ** consecutive_failures, 120)
+            err(f"Backing off for {delay}s after {consecutive_failures} consecutive failure(s)")
+            time.sleep(delay)
 
 
 if __name__ == "__main__":

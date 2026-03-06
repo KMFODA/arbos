@@ -2,7 +2,10 @@
 
 ![Arbos](arbos.jpg)
 
-Welcome! Arbos is simply a Ralph-loop—see [ghuntley.com/loop](https://ghuntley.com/loop/)—combined with a Telegram bot. That's all you need to do just about anything.
+<p align="center">
+  Welcome! Arbos is simply a <a href="https://ghuntley.com/loop/">Ralph-loop</a> combined with a Telegram bot.<br>
+  That's all you need to do just about anything.
+</p>
 
 ## Getting started
 

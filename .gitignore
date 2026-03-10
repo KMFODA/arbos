@@ -20,4 +20,5 @@ logs/*
 .arbos.pid
 .restart
 .codex-pool/
+.claude/settings.local.json
 chat_id.txt

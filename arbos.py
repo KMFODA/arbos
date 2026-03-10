@@ -212,7 +212,7 @@ def _generate_step_update(*, step_number: int, success: bool, run_dir: Path) -> 
         f"Logs:\n{_clip_text(logs_text, STEP_SOURCE_CHAR_LIMIT)}"
     )
 
-    summary_cmd = ["claude", "-p", prompt, "--dangerously-skip-permissions", "--output-format", "stream-json"]
+    summary_cmd = ["claude", "-p", prompt, "--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose"]
     if STEP_SUMMARY_MODEL:
         summary_cmd.extend(["--model", STEP_SUMMARY_MODEL])
 
@@ -281,12 +281,34 @@ def _send_step_update(step_number: int, run_dir: Path, success: bool):
 
 # ── Agent runner ─────────────────────────────────────────────────────────────
 
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "anthropic/claude-sonnet-4")
+
+
+def _write_claude_settings():
+    """Write project-level .claude/settings.local.json to override any global config."""
+    settings_dir = WORKING_DIR / ".claude"
+    settings_dir.mkdir(exist_ok=True)
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    base_url = os.environ.get("ANTHROPIC_BASE_URL", "https://openrouter.ai/api")
+    settings = {
+        "model": CLAUDE_MODEL,
+        "env": {
+            "ANTHROPIC_BASE_URL": base_url,
+            "ANTHROPIC_API_KEY": api_key,
+            "ANTHROPIC_AUTH_TOKEN": "",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        },
+    }
+    (settings_dir / "settings.local.json").write_text(json.dumps(settings, indent=2))
+    _log(f"wrote .claude/settings.local.json (model={CLAUDE_MODEL})")
+
+
 def _claude_env() -> dict[str, str]:
     env = os.environ.copy()
     api_key = env.get("OPENROUTER_API_KEY")
     if api_key:
         env["ANTHROPIC_API_KEY"] = api_key
-    env.setdefault("ANTHROPIC_BASE_URL", "https://openrouter.ai/api/v1")
+    env.setdefault("ANTHROPIC_BASE_URL", "https://openrouter.ai/api")
     return env
 
 
@@ -297,11 +319,13 @@ def _run_claude_once(cmd, env):
     """Run a single claude subprocess, return (returncode, result_text, raw_lines, stderr)."""
     proc = subprocess.Popen(
         cmd, cwd=WORKING_DIR, env=env,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, bufsize=1,
     )
 
     result_text = ""
+    assistant_texts: list[str] = []
     raw_lines: list[str] = []
     for line in iter(proc.stdout.readline, ""):
         raw_lines.append(line)
@@ -309,8 +333,16 @@ def _run_claude_once(cmd, env):
             evt = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if evt.get("type") == "result":
+        etype = evt.get("type", "")
+        if etype == "assistant":
+            for block in evt.get("message", {}).get("content", []):
+                if block.get("type") == "text" and block.get("text"):
+                    assistant_texts.append(block["text"])
+        elif etype == "result":
             result_text = evt.get("result", "")
+
+    if not result_text and assistant_texts:
+        result_text = assistant_texts[-1]
 
     stderr_output = proc.stderr.read() if proc.stderr else ""
     returncode = proc.wait()
@@ -383,7 +415,7 @@ def run_step(prompt: str, step_number: int) -> bool:
         _send_telegram_text(f"Step {step_number}: starting plan phase")
 
         plan_result = run_agent(
-            ["claude", "-p", prompt, "--dangerously-skip-permissions", "--output-format", "stream-json"],
+            ["claude", "-p", prompt, "--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose"],
             phase="plan",
             output_file=run_dir / "plan_output.txt",
         )
@@ -405,7 +437,7 @@ def run_step(prompt: str, step_number: int) -> bool:
         _send_telegram_text(f"Step {step_number}: starting exec phase")
 
         exec_result = run_agent(
-            ["claude", "-p", execute_prompt, "--dangerously-skip-permissions", "--output-format", "stream-json"],
+            ["claude", "-p", execute_prompt, "--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose"],
             phase="exec",
             output_file=run_dir / "exec_output.txt",
         )
@@ -527,7 +559,7 @@ def _build_operator_prompt(user_text: str) -> str:
 
 def run_agent_streaming(bot, prompt: str, chat_id: int) -> str:
     """Run Claude Code CLI and stream output into a Telegram message."""
-    cmd = ["claude", "-p", prompt, "--dangerously-skip-permissions", "--output-format", "stream-json"]
+    cmd = ["claude", "-p", prompt, "--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose"]
 
     msg = bot.send_message(chat_id, "Running...")
     current_text = ""
@@ -633,6 +665,7 @@ def run_bot():
 def main() -> None:
     _log(f"arbos starting in {WORKING_DIR}")
     CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
+    _write_claude_settings()
 
     threading.Thread(target=agent_loop, daemon=True).start()
     threading.Thread(target=run_bot, daemon=True).start()

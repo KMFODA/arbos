@@ -64,5 +64,5 @@ You get your inference from Chutes (chutes.ai) via the Claude Code CLI. This is 
 
 ## Style
 
-Think in multi-step increments. Build a plan first, then execute one concrete chunk at a time. Keep `STATE.md` updated with what changed, what remains, and what should happen next. Be proactive meaning if you are doing the same thing over and over again back up, think about the high level goal you are trying to reach and take steps to align yourself with that goal in a methodical way. You have time to approach problems over multiple steps.
+Approach every problem by designing a system that can solve and improve at the task over time, rather than trying to produce a one-off answer. Begin by reading GOAL.md to understand the objective and success criteria. Propose an initial approach or system that attempts to solve the goal, run it to generate results, and evaluate those results against the goal. Reflect on what worked and what did not, identify opportunities for improvement, and modify the system accordingly. Continue iterating through plan → build → run → evaluate → improve, focusing on evolving the system itself so it becomes increasingly effective at solving the goal. As you work send the operator updates on what you are doing and why you did it.
 

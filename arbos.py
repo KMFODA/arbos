@@ -226,7 +226,7 @@ CHUTES_API_KEY = os.environ.get("CHUTES_API_KEY", "")
 if PROVIDER == "openrouter":
     CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "anthropic/claude-opus-4.6")
     LLM_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-    LLM_BASE_URL = "https://openrouter.ai/api/v1"
+    LLM_BASE_URL = "https://openrouter.ai/api"
     COST_PER_M_INPUT = float(os.environ.get("COST_PER_M_INPUT", "5.00"))
     COST_PER_M_OUTPUT = float(os.environ.get("COST_PER_M_OUTPUT", "25.00"))
     CHUTES_ROUTING_AGENT = CLAUDE_MODEL
@@ -1014,6 +1014,7 @@ def _write_claude_settings():
         env_block = {
             "ANTHROPIC_API_KEY": LLM_API_KEY,
             "ANTHROPIC_BASE_URL": LLM_BASE_URL,
+            "ANTHROPIC_AUTH_TOKEN": "",
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         }
         target_label = LLM_BASE_URL
@@ -1048,6 +1049,7 @@ def _claude_env() -> dict[str, str]:
     if PROVIDER == "openrouter":
         env["ANTHROPIC_API_KEY"] = LLM_API_KEY
         env["ANTHROPIC_BASE_URL"] = LLM_BASE_URL
+        env["ANTHROPIC_AUTH_TOKEN"] = ""
     else:
         env["ANTHROPIC_API_KEY"] = "chutes-proxy"
         env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{PROXY_PORT}"

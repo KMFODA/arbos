@@ -848,14 +848,14 @@ class HardenedScoringEngine:
                         )
 
             # Divergence penalty (per-epoch)
-            # Compares organic vs synthetic speed scores. At pass_rate<1.0, moderate
-            # divergence is penalized. At pass_rate=1.0, miners have proven honesty via
-            # hidden state verification — performance divergence is more likely from
-            # infrastructure effects (proxy latency, concurrency contention) than
-            # selective throttling. Only penalize at very high thresholds.
+            # Compares organic vs synthetic speed scores. Infrastructure noise causes
+            # high divergence for ALL miners (6-14x) regardless of honesty. Only penalize
+            # when pass_rate is significantly below 1.0 (multiple genuine failures),
+            # not from a single transient failure. At pass_rate>=0.90, divergence is
+            # much more likely infrastructure effects than selective throttling.
             pr = stats.pass_rate
             div = stats.divergence
-            if pr < 1.0:
+            if pr < 0.90:
                 if div > 0.25:
                     weight *= (1.0 - DIVERGENCE_PENALTY_SEVERE)
                     if uid not in self._divergence_warned:
@@ -867,22 +867,22 @@ class HardenedScoringEngine:
                         log.warning(f"Miner {uid}: mild divergence={div:.3f} → -30% weight")
                         self._divergence_warned.add(uid)
             elif div > DIVERGENCE_THRESHOLD:
-                # pass_rate=1.0: miner passes all challenges, divergence is likely
+                # pass_rate>=0.90: miner mostly passes challenges, divergence is likely
                 # infrastructure noise (Cloudflare proxy, concurrency, network hops).
                 # Only log once, no weight penalty.
                 if uid not in self._divergence_warned:
-                    log.info(f"Miner {uid}: divergence={div:.3f} but pass_rate=100% — monitoring only")
+                    log.info(f"Miner {uid}: divergence={div:.3f} but pass_rate={pr:.0%} — monitoring only")
                     self._divergence_warned.add(uid)
 
             # Cross-epoch divergence: catches miners staying under per-epoch sample minimums
-            # Same policy as per-epoch: penalize at pr<1.0, monitor-only at pr=1.0.
+            # Same policy as per-epoch: only penalize at pr<0.90 (multiple genuine failures).
             cross = self._cross_epoch_scores.get(uid)
             if cross and len(cross["organic"]) >= MIN_ORGANIC_SAMPLES and len(cross["synthetic"]) >= MIN_SYNTHETIC_SAMPLES:
                 cross_org_mean = sum(cross["organic"]) / len(cross["organic"])
                 cross_syn_mean = sum(cross["synthetic"]) / len(cross["synthetic"])
                 if cross_syn_mean > 0:
                     cross_div = abs(cross_org_mean - cross_syn_mean) / max(cross_syn_mean, 0.001)
-                    if pr < 1.0:
+                    if pr < 0.90:
                         if cross_div > 0.25:
                             weight *= (1.0 - DIVERGENCE_PENALTY_SEVERE)
                             if uid not in self._cross_div_warned:
@@ -895,7 +895,7 @@ class HardenedScoringEngine:
                                 self._cross_div_warned.add(uid)
                     elif cross_div > DIVERGENCE_THRESHOLD:
                         if uid not in self._cross_div_warned:
-                            log.info(f"Miner {uid}: cross-epoch divergence={cross_div:.3f} but pass_rate=100% — monitoring only")
+                            log.info(f"Miner {uid}: cross-epoch divergence={cross_div:.3f} but pass_rate={pr:.0%} — monitoring only")
                             self._cross_div_warned.add(uid)
 
             # Suspect penalty (current epoch)

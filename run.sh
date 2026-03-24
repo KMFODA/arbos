@@ -326,8 +326,7 @@ printf "\n"
 sleep 2
 if pm2 pid "$PM2_NAME" >/dev/null 2>&1 && [ -n "$(pm2 pid "$PM2_NAME")" ]; then
     ok "Arbos running"
-    printf "\n  ${CYAN}Last 20 lines from logs:${NC}\n"
-    pm2 logs "$PM2_NAME" --lines 20 --nostream
+    pm2 logs "$PM2_NAME"
 else
     err "Arbos may not have started — check logs:"
     printf "    ${DIM}pm2 logs $PM2_NAME${NC}\n"

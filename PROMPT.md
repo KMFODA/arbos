@@ -15,7 +15,7 @@ context/
   GOAL.md         — your objective (read-only unless told otherwise)
   STATE.md        — your working memory and notes to yourself
   INBOX.md        — messages from the operator (consumed after each step)
-  claude_invocations.json — registry of active/recent Claude invocations
+  invocations.json — registry of active/recent Claude invocations
   runs/           — per-step artifacts (rollout.md, logs.txt, output.txt)
   chat/           — rolling Telegram transcript (shared with the operator)
   files/          — files the operator sent via Telegram
@@ -57,14 +57,14 @@ You have **no memory between steps**. Each step is a fresh CLI invocation. The o
 
 Before you finish **every** step, update `context/STATE.md` with a short note about what changed, where things stand, and what the next action should be. Do this even for inspection-only steps or failed attempts. A small host-written sync block may appear at the bottom of `STATE.md`; keep your own notes above it.
 
-If you need to understand what Claude processes are active right now, inspect `context/claude_invocations.json`. It records active and recent invocations, including status, step label, pid, start/finish time, uptime or duration, run directory, log/output/rollout paths, and usage when available. Use it to tell whether a step is still running, where to look for its logs, and which specific Claude subprocess to kill if one is stuck. For per-run detail, inspect `context/runs/<timestamp>/invocation-<attempt>.json`.
+If you need to understand what Claude processes are active right now, inspect `context/invocations.json`. It records active and recent invocations, including status, step label, pid, start/finish time, uptime or duration, run directory, log/output/rollout paths, and usage when available. Use it to tell whether a step is still running, where to look for its logs, and which specific Claude subprocess to kill if one is stuck. For per-run detail, inspect `context/runs/<timestamp>/invocation-<attempt>.json`.
 
 ## Conventions
 
 - **State**: Keep your `STATE.md` short, high-signal, action-oriented, and refreshed every step.
 - **Goal**: Do not edit `context/GOAL.md` unless the operator explicitly asks for that.
 - **Chat history**: The durable operator interaction log lives in `context/chat/*.jsonl`.
-- **Claude invocation metadata**: `context/claude_invocations.json` is the top-level registry for active/recent Claude runs; per-run metadata lives beside artifacts under `context/runs/<timestamp>/invocation-<attempt>.json`.
+- **Claude invocation metadata**: `context/invocations.json` is the top-level registry for active/recent Claude runs; per-run metadata lives beside artifacts under `context/runs/<timestamp>/invocation-<attempt>.json`.
 - **Run artifacts**: Step-specific outputs live in `context/runs/<timestamp>/`.
 - **Shared tools**: Put reusable scripts in `context/tools/` when they are generally useful.
 - **Background processes**: Use `pm2` for long-lived processes and leave enough breadcrumbs in `STATE.md` for the next step.

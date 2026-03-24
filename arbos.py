@@ -33,7 +33,7 @@ STATE_FILE = CONTEXT_DIR / "STATE.md"
 INBOX_FILE = CONTEXT_DIR / "INBOX.md"
 RUNS_DIR = CONTEXT_DIR / "runs"
 META_FILE = CONTEXT_DIR / "meta.json"
-CLAUDE_INVOCATIONS_FILE = CONTEXT_DIR / "claude_invocations.json"
+CLAUDE_INVOCATIONS_FILE = CONTEXT_DIR / "invocations.json"
 STEP_MSG_FILE = CONTEXT_DIR / ".step_msg"
 CONTEXT_LOGS_DIR = CONTEXT_DIR / "logs"
 CHATLOG_DIR = CONTEXT_DIR / "chat"
@@ -698,11 +698,11 @@ def _fmt_context_for_header(
     paid_usage = paid_usage or ClaudeUsage()
     paid_in = _fmt_token_count(paid_usage.total_input_tokens)
     if attempt_inflight and est > 0:
-        return f"paid {paid_in} in (+ est {_fmt_token_count(est)} current)"
+        return f"{paid_in} in (+ est {_fmt_token_count(est)} current)"
     if paid_usage.total_input_tokens > 0 or paid_usage.output_tokens > 0:
-        return f"paid {paid_in} in, {_fmt_token_count(paid_usage.output_tokens)} out"
+        return f"{paid_in} in, {_fmt_token_count(paid_usage.output_tokens)} out"
     if est > 0:
-        return f"paid {paid_in} in (+ est {_fmt_token_count(est)} current)"
+        return f"{paid_in} in (+ est {_fmt_token_count(est)} current)"
     return "usage pending"
 
 
@@ -896,7 +896,7 @@ def load_prompt(consume_inbox: bool = False, agent_step: int = 0) -> str:
             parts.append(
                 f"{header}\n\n{goal_text}\n\n"
                 "Your context files are under context/: STATE.md, INBOX.md, runs/, "
-                "chat/, files/, tools/, workspace/, and claude_invocations.json "
+                "chat/, files/, tools/, workspace/, and invocations.json "
                 "(see PROMPT.md)."
             )
     if STATE_FILE.exists():
@@ -1125,14 +1125,14 @@ def _claude_invocations_prompt_section(limit: int = 8) -> str:
     if not items:
         return (
             "## Claude invocations\n\n"
-            "Registry: `context/claude_invocations.json`\n"
+            "Registry: `context/invocations.json`\n"
             "Per-run metadata: `context/runs/<timestamp>/invocation-<attempt>.json`\n"
             "No Claude invocations have been recorded in this process yet."
         )
     lines = [
         "## Claude invocations",
         "",
-        "Registry: `context/claude_invocations.json`",
+        "Registry: `context/invocations.json`",
         "Per-run metadata: `context/runs/<timestamp>/invocation-<attempt>.json`",
         "Use the `pid` there if you need to inspect or kill a stuck Claude subprocess.",
         "",
@@ -2770,7 +2770,7 @@ def _build_operator_prompt(user_text: str, *, reply_context: str | None = None) 
         "- **Set system prompt**: write to `PROMPT.md`.\n"
         "- **Set env variable**: write `KEY='VALUE'` lines (one per line) to `context/.env.pending`. They are picked up automatically and persisted.\n"
         "- **View logs**: read files in `context/runs/<timestamp>/` (rollout.md, logs.txt).\n"
-        "- **Inspect Claude invocations**: read `context/claude_invocations.json` for active/recent subprocess metadata, and `context/runs/<timestamp>/invocation-<attempt>.json` for per-run details.\n"
+        "- **Inspect Claude invocations**: read `context/invocations.json` for active/recent subprocess metadata, and `context/runs/<timestamp>/invocation-<attempt>.json` for per-run details.\n"
         "- **Kill a stuck Claude run**: use the `pid` from the invocation metadata and terminate that specific subprocess.\n"
         "- **Modify code & restart**: edit code files, then run `touch .restart`.\n"
         "- **Send follow-up**: run `python arbos.py send \"your text here\"`.\n"
@@ -3409,7 +3409,11 @@ def run_bot():
             _reply(message, "No goal in GOAL.md — use /loop <goal> first.")
             return
         if GO_FLAG_FILE.exists():
-            _reply(message, "Already going (GO.md already present).")
+            _reply(
+                message,
+                "Already resumed: context/GO.md is already present, so the loop is enabled.",
+            )
+            _log("agent /resume ignored (GO.md already present)")
             return
         _write_go_flag()
         with _agent_lock:
@@ -3420,7 +3424,10 @@ def run_bot():
             _save_agent()
         gs.wake.set()
         _ensure_agent_thread()
-        _reply(message, "Resumed (created context/GO.md).")
+        _reply(
+            message,
+            "Resumed: created context/GO.md and woke the agent loop.",
+        )
         _log("agent resumed via /resume (GO.md created)")
 
     @bot.message_handler(commands=["force"])
@@ -3565,7 +3572,6 @@ def run_bot():
             _reject(message)
             return
         _save_operator_telegram(message)
-        import shutil
         with _agent_lock:
             gs = _agent
             gs.stop_event.set()
@@ -3581,25 +3587,22 @@ def run_bot():
             gs.last_finished = ""
             gs.last_step_ok = None
             gs.last_step_error = ""
+        _kill_child_procs()
+        killed = _kill_registered_claude_procs(detail="killed via /clear")
         if thread and thread.is_alive():
             thread.join(timeout=8)
         with _agent_lock:
             gs.stop_event.clear()
             gs.thread = None
-            _save_agent()
-        STEP_MSG_FILE.unlink(missing_ok=True)
+        _clear_agent_runtime_history()
         with _pending_step_msg_lock:
             _pending_step_msg_id = None
-        for path in (GOAL_FILE, GO_FLAG_FILE, STATE_FILE, INBOX_FILE):
-            path.unlink(missing_ok=True)
-        if RUNS_DIR.exists():
-            shutil.rmtree(RUNS_DIR, ignore_errors=True)
-        RUNS_DIR.mkdir(parents=True, exist_ok=True)
         _reply(
             message,
-            "Loop cleared (GOAL/GO/STATE/INBOX/runs reset). Use /loop to start again.",
+            "Loop cleared (goal, invocations, runs, logs, and chat history reset). "
+            f"Killed {killed} live Claude process(es). Use /loop to start again.",
         )
-        _log("goal cleared via /clear")
+        _log("runtime cleared via /clear")
 
     @bot.message_handler(commands=["restart"])
     def handle_restart(message):
@@ -3839,6 +3842,96 @@ def _kill_child_procs():
             pass
     with _child_procs_lock:
         _child_procs.clear()
+
+
+def _pid_looks_like_claude(pid: int) -> bool:
+    """Best-effort guard against killing a reused, unrelated PID."""
+    if pid <= 0:
+        return False
+    proc_dir = Path("/proc") / str(pid)
+    try:
+        cmdline = (proc_dir / "cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", "ignore")
+        if cmdline.strip():
+            return "claude" in cmdline.lower()
+    except OSError:
+        pass
+    try:
+        return "claude" in (proc_dir / "comm").read_text().strip().lower()
+    except OSError:
+        return False
+
+
+def _kill_registered_claude_procs(*, detail: str) -> int:
+    """Kill running Claude PIDs from the in-memory + on-disk registry."""
+    pids: set[int] = set()
+    with _claude_invocations_lock:
+        for meta in _claude_invocations.values():
+            if meta.get("status") != "running":
+                continue
+            pid = _safe_int(meta.get("pid"))
+            if pid:
+                pids.add(pid)
+    if CLAUDE_INVOCATIONS_FILE.exists():
+        try:
+            payload = json.loads(CLAUDE_INVOCATIONS_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            payload = {}
+        for item in payload.get("items", []):
+            if not isinstance(item, dict) or item.get("status") != "running":
+                continue
+            pid = _safe_int(item.get("pid"))
+            if pid:
+                pids.add(pid)
+
+    killed = 0
+    for pid in sorted(pids):
+        if pid == os.getpid() or not _pid_looks_like_claude(pid):
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+            killed += 1
+            _log(f"killed registered claude pid={pid}")
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            continue
+        finally:
+            _mark_claude_invocation_pid_status(pid, status="killed", detail=detail)
+    return killed
+
+
+def _truncate_context_logs() -> None:
+    import shutil
+
+    if not CONTEXT_LOGS_DIR.exists():
+        CONTEXT_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        return
+    for path in CONTEXT_LOGS_DIR.iterdir():
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+            continue
+        try:
+            path.write_text("")
+        except OSError:
+            pass
+    CONTEXT_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _clear_agent_runtime_history() -> None:
+    """Remove persisted state/history so the next run starts clean."""
+    import shutil
+
+    STEP_MSG_FILE.unlink(missing_ok=True)
+    for path in (GOAL_FILE, GO_FLAG_FILE, STATE_FILE, INBOX_FILE, META_FILE):
+        path.unlink(missing_ok=True)
+    if RUNS_DIR.exists():
+        shutil.rmtree(RUNS_DIR, ignore_errors=True)
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    if CHATLOG_DIR.exists():
+        shutil.rmtree(CHATLOG_DIR, ignore_errors=True)
+    CHATLOG_DIR.mkdir(parents=True, exist_ok=True)
+    _reset_claude_invocations()
+    _truncate_context_logs()
 
 
 def _kill_stale_claude_procs():

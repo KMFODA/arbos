@@ -13,3 +13,6 @@ dependencies = [
 
 [tool.setuptools]
 py-modules = ["arbos"]
+
+[project.scripts]
+arbos = "arbos:main"

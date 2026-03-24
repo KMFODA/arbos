@@ -1,3 +1,4 @@
+import argparse
 import base64
 import json
 import os
@@ -23,29 +24,189 @@ from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
 
-WORKING_DIR = Path(__file__).parent
-PROMPT_FILE = WORKING_DIR / "PROMPT.md"
-CONTEXT_DIR = WORKING_DIR / "context"
-GOAL_FILE = CONTEXT_DIR / "GOAL.md"
-# Presence of GO.md = goal loop may run steps; absence = paused (GOAL.md unchanged).
-GO_FLAG_FILE = CONTEXT_DIR / "GO.md"
-STATE_FILE = CONTEXT_DIR / "STATE.md"
-INBOX_FILE = CONTEXT_DIR / "INBOX.md"
-RUNS_DIR = CONTEXT_DIR / "runs"
-META_FILE = CONTEXT_DIR / "meta.json"
-CLAUDE_INVOCATIONS_FILE = CONTEXT_DIR / "invocations.json"
-STEP_MSG_FILE = CONTEXT_DIR / ".step_msg"
-CONTEXT_LOGS_DIR = CONTEXT_DIR / "logs"
-CHATLOG_DIR = CONTEXT_DIR / "chat"
-FILES_DIR = CONTEXT_DIR / "files"
-RESTART_FLAG = WORKING_DIR / ".restart"
-CHAT_ID_FILE = WORKING_DIR / "chat_id.txt"
-# Forum supergroup topic for operator + goal-loop bubbles (same thread as streaming /operator replies).
-OPERATOR_THREAD_ID_FILE = WORKING_DIR / "operator_thread_id.txt"
-ENV_ENC_FILE = WORKING_DIR / ".env.enc"
+CODE_DIR = Path(__file__).resolve().parent
+PROMPT_FILE = CODE_DIR / "PROMPT.md"
+PROJECTS_ROOT = CODE_DIR / "context"
 ARBOS_STEP_STREAM_ID_ENV = "ARBOS_STEP_STREAM_ID"
 STATE_AUTOSYNC_START = "<!-- ARBOS_STATE_AUTOSYNC_START -->"
 STATE_AUTOSYNC_END = "<!-- ARBOS_STATE_AUTOSYNC_END -->"
+
+
+@dataclass(frozen=True)
+class InstancePaths:
+    project_name: str
+    instance_name: str
+    project_dir: Path
+    context_dir: Path
+    workspace_dir: Path
+    goal_file: Path
+    go_flag_file: Path
+    state_file: Path
+    inbox_file: Path
+    runs_dir: Path
+    meta_file: Path
+    claude_invocations_file: Path
+    step_msg_file: Path
+    context_logs_dir: Path
+    chatlog_dir: Path
+    files_dir: Path
+    restart_flag: Path
+    chat_id_file: Path
+    operator_thread_id_file: Path
+    env_file: Path
+    env_enc_file: Path
+    env_pending_file: Path
+    claude_settings_dir: Path
+
+
+def _resolve_project_dir(project_arg: str | None) -> tuple[str, Path]:
+    raw = (project_arg or os.environ.get("ARBOS_PROJECT") or "default").strip()
+    if not raw:
+        raw = "default"
+    candidate = Path(raw).expanduser()
+    if candidate.is_absolute():
+        project_dir = candidate.resolve()
+        project_name = project_dir.name
+    elif "/" in raw or raw.startswith("."):
+        project_dir = (CODE_DIR / candidate).resolve()
+        project_name = project_dir.name
+    else:
+        project_name = raw
+        project_dir = (PROJECTS_ROOT / raw).resolve()
+    return project_name, project_dir
+
+
+def _build_instance_paths(project_arg: str | None) -> InstancePaths:
+    project_name, project_dir = _resolve_project_dir(project_arg)
+    context_dir = project_dir
+    workspace_dir = project_dir / "workspace"
+    return InstancePaths(
+        project_name=project_name,
+        instance_name=project_name,
+        project_dir=project_dir,
+        context_dir=context_dir,
+        workspace_dir=workspace_dir,
+        goal_file=context_dir / "GOAL.md",
+        go_flag_file=context_dir / "GO.md",
+        state_file=context_dir / "STATE.md",
+        inbox_file=context_dir / "INBOX.md",
+        runs_dir=context_dir / "runs",
+        meta_file=context_dir / "meta.json",
+        claude_invocations_file=context_dir / "invocations.json",
+        step_msg_file=context_dir / ".step_msg",
+        context_logs_dir=context_dir / "logs",
+        chatlog_dir=context_dir / "chat",
+        files_dir=context_dir / "files",
+        restart_flag=context_dir / ".restart",
+        chat_id_file=context_dir / "chat_id.txt",
+        operator_thread_id_file=context_dir / "operator_thread_id.txt",
+        env_file=context_dir / ".env",
+        env_enc_file=context_dir / ".env.enc",
+        env_pending_file=context_dir / ".env.pending",
+        claude_settings_dir=context_dir / ".claude",
+    )
+
+
+INSTANCE_PATHS = _build_instance_paths(None)
+PROJECT_NAME = INSTANCE_PATHS.project_name
+INSTANCE_NAME = INSTANCE_PATHS.instance_name
+PROJECT_DIR = INSTANCE_PATHS.project_dir
+CONTEXT_DIR = INSTANCE_PATHS.context_dir
+WORKSPACE_DIR = INSTANCE_PATHS.workspace_dir
+GOAL_FILE = INSTANCE_PATHS.goal_file
+# Presence of GO.md = goal loop may run steps; absence = paused (GOAL.md unchanged).
+GO_FLAG_FILE = INSTANCE_PATHS.go_flag_file
+STATE_FILE = INSTANCE_PATHS.state_file
+INBOX_FILE = INSTANCE_PATHS.inbox_file
+RUNS_DIR = INSTANCE_PATHS.runs_dir
+META_FILE = INSTANCE_PATHS.meta_file
+CLAUDE_INVOCATIONS_FILE = INSTANCE_PATHS.claude_invocations_file
+STEP_MSG_FILE = INSTANCE_PATHS.step_msg_file
+CONTEXT_LOGS_DIR = INSTANCE_PATHS.context_logs_dir
+CHATLOG_DIR = INSTANCE_PATHS.chatlog_dir
+FILES_DIR = INSTANCE_PATHS.files_dir
+RESTART_FLAG = INSTANCE_PATHS.restart_flag
+CHAT_ID_FILE = INSTANCE_PATHS.chat_id_file
+# Forum supergroup topic for operator + goal-loop bubbles (same thread as streaming /operator replies).
+OPERATOR_THREAD_ID_FILE = INSTANCE_PATHS.operator_thread_id_file
+ENV_FILE = INSTANCE_PATHS.env_file
+ENV_ENC_FILE = INSTANCE_PATHS.env_enc_file
+ENV_PENDING_FILE = INSTANCE_PATHS.env_pending_file
+CLAUDE_SETTINGS_DIR = INSTANCE_PATHS.claude_settings_dir
+
+
+def _apply_instance_paths(paths: InstancePaths) -> None:
+    global INSTANCE_PATHS, PROJECT_NAME, INSTANCE_NAME, PROJECT_DIR, CONTEXT_DIR
+    global WORKSPACE_DIR
+    global GOAL_FILE, GO_FLAG_FILE, STATE_FILE, INBOX_FILE, RUNS_DIR, META_FILE
+    global CLAUDE_INVOCATIONS_FILE, STEP_MSG_FILE, CONTEXT_LOGS_DIR, CHATLOG_DIR
+    global FILES_DIR, RESTART_FLAG, CHAT_ID_FILE, OPERATOR_THREAD_ID_FILE
+    global ENV_FILE, ENV_ENC_FILE, ENV_PENDING_FILE, CLAUDE_SETTINGS_DIR
+
+    INSTANCE_PATHS = paths
+    PROJECT_NAME = paths.project_name
+    INSTANCE_NAME = paths.instance_name
+    PROJECT_DIR = paths.project_dir
+    CONTEXT_DIR = paths.context_dir
+    WORKSPACE_DIR = paths.workspace_dir
+    GOAL_FILE = paths.goal_file
+    GO_FLAG_FILE = paths.go_flag_file
+    STATE_FILE = paths.state_file
+    INBOX_FILE = paths.inbox_file
+    RUNS_DIR = paths.runs_dir
+    META_FILE = paths.meta_file
+    CLAUDE_INVOCATIONS_FILE = paths.claude_invocations_file
+    STEP_MSG_FILE = paths.step_msg_file
+    CONTEXT_LOGS_DIR = paths.context_logs_dir
+    CHATLOG_DIR = paths.chatlog_dir
+    FILES_DIR = paths.files_dir
+    RESTART_FLAG = paths.restart_flag
+    CHAT_ID_FILE = paths.chat_id_file
+    OPERATOR_THREAD_ID_FILE = paths.operator_thread_id_file
+    ENV_FILE = paths.env_file
+    ENV_ENC_FILE = paths.env_enc_file
+    ENV_PENDING_FILE = paths.env_pending_file
+    CLAUDE_SETTINGS_DIR = paths.claude_settings_dir
+
+
+HEALTH_PORT = 0
+CLAUDE_MODEL = "anthropic/claude-opus-4.6"
+LLM_API_KEY = ""
+LLM_BASE_URL = "https://openrouter.ai/api"
+IS_ROOT = os.getuid() == 0
+MAX_RETRIES = 5
+CLAUDE_TIMEOUT = 600
+CLAUDE_IDLE_KILL = True
+
+
+def _default_health_port(project_name: str) -> int:
+    digest = hashlib.sha1(project_name.encode("utf-8")).hexdigest()
+    return 8200 + (int(digest[:4], 16) % 2000)
+
+
+def _reload_runtime_config() -> None:
+    global HEALTH_PORT, CLAUDE_MODEL, LLM_API_KEY, MAX_RETRIES, CLAUDE_TIMEOUT
+    global CLAUDE_IDLE_KILL
+
+    HEALTH_PORT = int(
+        os.environ.get("ARBOS_HEALTH_PORT")
+        or os.environ.get("PROXY_PORT")
+        or str(_default_health_port(PROJECT_NAME))
+    )
+    CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "anthropic/claude-opus-4.6")
+    LLM_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+    try:
+        MAX_RETRIES = int(os.environ.get("CLAUDE_MAX_RETRIES", "5"))
+    except ValueError:
+        MAX_RETRIES = 5
+    try:
+        timeout = int(os.environ.get("CLAUDE_TIMEOUT", "600").strip())
+    except ValueError:
+        timeout = 600
+    if timeout < 0:
+        timeout = 600
+    CLAUDE_TIMEOUT = timeout
+    CLAUDE_IDLE_KILL = CLAUDE_TIMEOUT > 0
 
 # ── Encrypted .env ───────────────────────────────────────────────────────────
 
@@ -57,12 +218,11 @@ def _derive_fernet_key(passphrase: str) -> bytes:
 
 def _encrypt_env_file(bot_token: str):
     """Encrypt .env → .env.enc and delete the plaintext file."""
-    env_path = WORKING_DIR / ".env"
-    plaintext = env_path.read_bytes()
+    plaintext = ENV_FILE.read_bytes()
     f = Fernet(_derive_fernet_key(bot_token))
     ENV_ENC_FILE.write_bytes(f.encrypt(plaintext))
     os.chmod(str(ENV_ENC_FILE), 0o600)
-    env_path.unlink()
+    ENV_FILE.unlink()
 
 
 def _decrypt_env_content(bot_token: str) -> str:
@@ -111,16 +271,10 @@ def _save_to_encrypted_env(key: str, value: str):
     ENV_ENC_FILE.write_bytes(f.encrypt("\n".join(lines).encode()))
     os.environ[key] = value
 
-
-ENV_PENDING_FILE = CONTEXT_DIR / ".env.pending"
-
-
 def _init_env():
     """Load environment from .env (plaintext) or .env.enc (encrypted)."""
-    env_path = WORKING_DIR / ".env"
-
-    if env_path.exists():
-        load_dotenv(env_path)
+    if ENV_FILE.exists():
+        load_dotenv(ENV_FILE)
         return
 
     bot_token = os.environ.get("TAU_BOT_TOKEN", "")
@@ -132,7 +286,7 @@ def _init_env():
 
     if ENV_ENC_FILE.exists() and not bot_token:
         print("ERROR: .env.enc exists but TAU_BOT_TOKEN not set.", file=sys.stderr)
-        print("Pass it as an env var: TAU_BOT_TOKEN=xxx python arbos.py", file=sys.stderr)
+        print("Pass it as an env var: TAU_BOT_TOKEN=xxx arbos -p <project>", file=sys.stderr)
         sys.exit(1)
 
 
@@ -154,9 +308,8 @@ def _process_pending_env():
             k, v = k.strip(), v.strip().strip("'\"")
             os.environ[k] = v
 
-        env_path = WORKING_DIR / ".env"
-        if env_path.exists():
-            with open(env_path, "a") as f:
+        if ENV_FILE.exists():
+            with open(ENV_FILE, "a") as f:
                 f.write("\n" + content + "\n")
         elif ENV_ENC_FILE.exists():
             bot_token = os.environ.get("TAU_BOT_TOKEN", "")
@@ -170,10 +323,7 @@ def _process_pending_env():
                 ENV_ENC_FILE.write_bytes(enc.encrypt(new_content.encode()))
 
         _reload_env_secrets()
-        _log(f"loaded pending env vars from .env.pending")
-
-
-_init_env()
+        _log(f"loaded pending env vars from {ENV_PENDING_FILE}")
 
 # ── Redaction ────────────────────────────────────────────────────────────────
 
@@ -227,20 +377,6 @@ def _redact_secrets(text: str) -> str:
     for pattern in _SECRET_PATTERNS:
         text = pattern.sub("[REDACTED]", text)
     return text
-HEALTH_PORT = int(os.environ.get("ARBOS_HEALTH_PORT") or os.environ.get("PROXY_PORT", "8089"))
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "anthropic/claude-opus-4.6")
-LLM_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-LLM_BASE_URL = "https://openrouter.ai/api"
-IS_ROOT = os.getuid() == 0
-MAX_RETRIES = int(os.environ.get("CLAUDE_MAX_RETRIES", "5"))
-try:
-    _claude_timeout_raw = int(os.environ.get("CLAUDE_TIMEOUT", "600").strip())
-except ValueError:
-    _claude_timeout_raw = 600
-if _claude_timeout_raw < 0:
-    _claude_timeout_raw = 600
-CLAUDE_TIMEOUT = _claude_timeout_raw
-CLAUDE_IDLE_KILL = CLAUDE_TIMEOUT > 0
 _tls = threading.local()
 _log_lock = threading.Lock()
 _chatlog_lock = threading.Lock()
@@ -310,7 +446,7 @@ def _persist_env_var_with_comment(key: str, value: str, description: str) -> tup
     except ValueError as e:
         return False, str(e)
     value_line = f'{key}="{escaped}"'
-    env_path = WORKING_DIR / ".env"
+    env_path = ENV_FILE
 
     with _pending_env_lock:
         if env_path.exists():
@@ -739,6 +875,7 @@ _ARBOS_ENV_BUILTIN_DOC: dict[str, str] = {
     "ANTHROPIC_AUTH_TOKEN": "Optional auth token for the API (cleared when using OpenRouter).",
     "ANTHROPIC_BASE_URL": "Anthropic-compatible API base URL (OpenRouter).",
     "ARBOS_HEALTH_PORT": "Local HTTP /health port for this Arbos process.",
+    "ARBOS_WORKSPACE_DIR": "Project workspace directory used as the coding agent subprocess cwd.",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "Claude Code setting to reduce background traffic.",
     "CLAUDE_MAX_RETRIES": "Retries when a Claude run fails.",
     "CLAUDE_MODEL": "Model id for Claude Code (e.g. anthropic/claude-opus-4.6).",
@@ -791,9 +928,8 @@ def _env_key_looks_config_like(key: str) -> bool:
 
 def _read_project_dotenv_plaintext() -> str | None:
     """Raw .env text for metadata (comments + keys); None if unavailable."""
-    env_path = WORKING_DIR / ".env"
-    if env_path.exists():
-        return env_path.read_text()
+    if ENV_FILE.exists():
+        return ENV_FILE.read_text()
     if not ENV_ENC_FILE.exists():
         return None
     tok = os.environ.get("TAU_BOT_TOKEN", "")
@@ -881,22 +1017,59 @@ def format_available_env_vars_section(*, max_keys: int = 120) -> str:
     return "\n".join(lines)
 
 
+def _path_for_display(path: Path | None) -> str:
+    if path is None:
+        return ""
+    try:
+        return str(path.relative_to(CODE_DIR))
+    except ValueError:
+        return str(path)
+
+
+def _prompt_placeholders() -> dict[str, str]:
+    return {
+        "{{ARBOS_ROOT_DIR}}": str(CODE_DIR),
+        "{{ARBOS_PROJECT_NAME}}": PROJECT_NAME,
+        "{{ARBOS_PROJECT_DIR}}": str(PROJECT_DIR),
+        "{{ARBOS_CONTEXT_DIR}}": str(CONTEXT_DIR),
+        "{{ARBOS_WORKSPACE_DIR}}": str(WORKSPACE_DIR),
+        "{{ARBOS_INSTANCE_NAME}}": INSTANCE_NAME,
+        "{{ARBOS_ENV_KEYS_SECTION}}": format_available_env_vars_section(),
+        "{{ARBOS_HEALTH_PORT}}": str(HEALTH_PORT),
+    }
+
+
+def _render_prompt_template(text: str) -> tuple[str, bool]:
+    rendered = text
+    used_env_placeholder = "{{ARBOS_ENV_KEYS_SECTION}}" in rendered
+    for placeholder, value in _prompt_placeholders().items():
+        rendered = rendered.replace(placeholder, value)
+    return rendered, used_env_placeholder
+
+
 def load_prompt(consume_inbox: bool = False, agent_step: int = 0) -> str:
     """Build full prompt: PROMPT.md + GOAL/STATE/INBOX + chatlog."""
     parts = []
+    prompt_has_env_placeholder = False
     if PROMPT_FILE.exists():
         text = PROMPT_FILE.read_text().strip()
         if text:
-            parts.append(text)
-    parts.append(format_available_env_vars_section())
+            rendered, prompt_has_env_placeholder = _render_prompt_template(text)
+            if rendered.strip():
+                parts.append(rendered.strip())
+    if not prompt_has_env_placeholder:
+        parts.append(format_available_env_vars_section())
     if GOAL_FILE.exists():
         goal_text = GOAL_FILE.read_text().strip()
         if goal_text:
             header = f"## Loop (step {agent_step})" if agent_step else "## Loop"
+            context_root = _path_for_display(CONTEXT_DIR)
+            workspace_root = _path_for_display(WORKSPACE_DIR)
             parts.append(
                 f"{header}\n\n{goal_text}\n\n"
-                "Your context files are under context/: STATE.md, INBOX.md, runs/, "
-                "chat/, files/, tools/, workspace/, and invocations.json "
+                f"Your context files are under `{context_root}/`: STATE.md, INBOX.md, runs/, "
+                "chat/, files/, and invocations.json. "
+                f"Your coding workspace is `{workspace_root}/`. "
                 "(see PROMPT.md)."
             )
     if STATE_FILE.exists():
@@ -932,7 +1105,7 @@ def _path_for_metadata(path: Path | None) -> str | None:
     if path is None:
         return None
     try:
-        return str(path.relative_to(WORKING_DIR))
+        return str(path.relative_to(PROJECT_DIR))
     except ValueError:
         return str(path)
 
@@ -1007,7 +1180,7 @@ def _persist_run_invocation_meta(meta: dict[str, Any]) -> None:
     run_dir_str = meta.get("run_dir")
     if not run_dir_str:
         return
-    run_dir = WORKING_DIR / run_dir_str
+    run_dir = PROJECT_DIR / run_dir_str
     run_dir.mkdir(parents=True, exist_ok=True)
     attempt = int(meta.get("attempt") or 0)
     file_name = f"invocation-{attempt}.json" if attempt > 0 else "invocation.json"
@@ -1122,18 +1295,20 @@ def _reset_claude_invocations() -> None:
 
 def _claude_invocations_prompt_section(limit: int = 8) -> str:
     items = _claude_invocation_items()
+    registry_path = _path_for_display(CLAUDE_INVOCATIONS_FILE)
+    run_meta_path = f"{_path_for_display(RUNS_DIR)}/<timestamp>/invocation-<attempt>.json"
     if not items:
         return (
             "## Claude invocations\n\n"
-            "Registry: `context/invocations.json`\n"
-            "Per-run metadata: `context/runs/<timestamp>/invocation-<attempt>.json`\n"
+            f"Registry: `{registry_path}`\n"
+            f"Per-run metadata: `{run_meta_path}`\n"
             "No Claude invocations have been recorded in this process yet."
         )
     lines = [
         "## Claude invocations",
         "",
-        "Registry: `context/invocations.json`",
-        "Per-run metadata: `context/runs/<timestamp>/invocation-<attempt>.json`",
+        f"Registry: `{registry_path}`",
+        f"Per-run metadata: `{run_meta_path}`",
         "Use the `pid` there if you need to inspect or kill a stuck Claude subprocess.",
         "",
     ]
@@ -1588,8 +1763,8 @@ def _claude_cmd(prompt: str, extra_flags: list[str] | None = None) -> list[str]:
 
 def _write_claude_settings():
     """Point Claude Code at OpenRouter (Anthropic-compatible API)."""
-    settings_dir = WORKING_DIR / ".claude"
-    settings_dir.mkdir(exist_ok=True)
+    settings_dir = CLAUDE_SETTINGS_DIR
+    settings_dir.mkdir(parents=True, exist_ok=True)
 
     env_block = {
         "ANTHROPIC_API_KEY": LLM_API_KEY,
@@ -1610,7 +1785,10 @@ def _write_claude_settings():
         "env": env_block,
     }
     (settings_dir / "settings.local.json").write_text(json.dumps(settings, indent=2))
-    _log(f"wrote .claude/settings.local.json (openrouter, model={CLAUDE_MODEL}, target={LLM_BASE_URL})")
+    _log(
+        f"wrote {settings_dir / 'settings.local.json'} "
+        f"(openrouter, model={CLAUDE_MODEL}, target={LLM_BASE_URL})"
+    )
 
 
 def _claude_env() -> dict[str, str]:
@@ -1619,6 +1797,9 @@ def _claude_env() -> dict[str, str]:
     env["ANTHROPIC_API_KEY"] = LLM_API_KEY
     env["ANTHROPIC_BASE_URL"] = LLM_BASE_URL
     env["ANTHROPIC_AUTH_TOKEN"] = ""
+    env["ARBOS_PROJECT"] = PROJECT_NAME
+    env["ARBOS_PROJECT_DIR"] = str(PROJECT_DIR)
+    env["ARBOS_WORKSPACE_DIR"] = str(WORKSPACE_DIR)
     return env
 
 
@@ -1691,7 +1872,7 @@ def _run_claude_once(
     on a full PIPE buffer.
     """
     proc = subprocess.Popen(
-        cmd, cwd=WORKING_DIR, env=env,
+        cmd, cwd=WORKSPACE_DIR, env=env,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, bufsize=1,
@@ -2378,14 +2559,14 @@ def _agent_loop():
                 if gs.paused:
                     gs.paused = False
                     _save_agent()
-            _operator_set("idle", "waiting for context/GOAL.md content")
+            _operator_set("idle", f"waiting for {_path_for_display(GOAL_FILE)} content")
             _agent_wait(gs, 5.0)
             continue
 
         if not GO_FLAG_FILE.exists():
             _operator_set(
                 "paused",
-                "paused — no context/GO.md (/resume or /loop to enable steps; GOAL.md unchanged)",
+                f"paused — no {_path_for_display(GO_FLAG_FILE)} (/resume or /loop to enable steps; GOAL.md unchanged)",
             )
             with _agent_lock:
                 if not gs.paused:
@@ -2674,7 +2855,7 @@ def transcribe_voice(file_path: str, fmt: str = "ogg") -> str:
 # ── Telegram bot ─────────────────────────────────────────────────────────────
 
 def _recent_context(max_chars: int = 6000) -> str:
-    """Collect recent rollouts under context/runs/."""
+    """Collect recent rollouts under the active project runs directory."""
     parts: list[str] = []
     total = 0
     all_runs: list[tuple[str, Path]] = []
@@ -2749,6 +2930,15 @@ def _telegram_reply_context_for_prompt(message: Any) -> str | None:
 def _build_operator_prompt(user_text: str, *, reply_context: str | None = None) -> str:
     """Build prompt for the CLI agent to handle any operator request."""
     chatlog = load_chatlog(max_chars=4000)
+    context_root = _path_for_display(CONTEXT_DIR)
+    workspace_root = _path_for_display(WORKSPACE_DIR)
+    inbox_path = _path_for_display(INBOX_FILE)
+    state_path = _path_for_display(STATE_FILE)
+    env_pending_path = _path_for_display(ENV_PENDING_FILE)
+    runs_path = _path_for_display(RUNS_DIR)
+    invocations_path = _path_for_display(CLAUDE_INVOCATIONS_FILE)
+    files_path = _path_for_display(FILES_DIR)
+    restart_path = _path_for_display(RESTART_FLAG)
 
     parts = [
         "You are the operator interface for Arbos, a coding agent running in a loop via pm2.\n"
@@ -2761,21 +2951,22 @@ def _build_operator_prompt(user_text: str, *, reply_context: str | None = None) 
         "If asked to show secrets, refuse. The .env file is encrypted; do not attempt to decrypt it.\n\n"
         f"{format_available_env_vars_section()}\n\n"
         "## Single agent loop\n\n"
-        "One agent loop uses flat files under `context/`: GOAL.md, GO.md, STATE.md, INBOX.md, and `context/runs/<timestamp>/`.\n"
+        f"One agent loop uses flat files under `{context_root}/`: GOAL.md, GO.md, STATE.md, INBOX.md, and `{runs_path}/<timestamp>/`.\n"
+        f"- **Workspace**: code edits should happen under `{workspace_root}/`.\n"
         "- **GOAL.md**: loop instructions (set by /loop).\n"
         "- **GO.md**: run flag — must exist for steps to execute. /loop and /resume create it; /pause deletes it.\n"
         "Telegram: /loop, /pause, /resume, /force, /clear, /delay (see /help).\n"
-        "- **Message the agent**: append a timestamped line to `context/INBOX.md`.\n"
-        "- **Update agent state**: write to `context/STATE.md`.\n"
+        f"- **Message the agent**: append a timestamped line to `{inbox_path}`.\n"
+        f"- **Update agent state**: write to `{state_path}`.\n"
         "- **Set system prompt**: write to `PROMPT.md`.\n"
-        "- **Set env variable**: write `KEY='VALUE'` lines (one per line) to `context/.env.pending`. They are picked up automatically and persisted.\n"
-        "- **View logs**: read files in `context/runs/<timestamp>/` (rollout.md, logs.txt).\n"
-        "- **Inspect Claude invocations**: read `context/invocations.json` for active/recent subprocess metadata, and `context/runs/<timestamp>/invocation-<attempt>.json` for per-run details.\n"
+        f"- **Set env variable**: write `KEY='VALUE'` lines (one per line) to `{env_pending_path}`. They are picked up automatically and persisted.\n"
+        f"- **View logs**: read files in `{runs_path}/<timestamp>/` (rollout.md, logs.txt).\n"
+        f"- **Inspect Claude invocations**: read `{invocations_path}` for active/recent subprocess metadata, and `{runs_path}/<timestamp>/invocation-<attempt>.json` for per-run details.\n"
         "- **Kill a stuck Claude run**: use the `pid` from the invocation metadata and terminate that specific subprocess.\n"
-        "- **Modify code & restart**: edit code files, then run `touch .restart`.\n"
-        "- **Send follow-up**: run `python arbos.py send \"your text here\"`.\n"
-        "- **Send file to operator**: run `python arbos.py sendfile path/to/file [--caption 'text'] [--photo]`.\n"
-        "- **Received files**: operator-sent files are saved in `context/files/` and their path is shown in the message.",
+        f"- **Modify code & restart**: edit code files, then run `touch {restart_path}`.\n"
+        f"- **Send follow-up**: run `arbos -p {PROJECT_NAME} send \"your text here\"`.\n"
+        f"- **Send file to operator**: run `arbos -p {PROJECT_NAME} sendfile path/to/file [--caption 'text'] [--photo]`.\n"
+        f"- **Received files**: operator-sent files are saved in `{files_path}/` and their path is shown in the message.",
     ]
 
     with _agent_lock:
@@ -3233,7 +3424,7 @@ def _enroll_owner(user_id: int):
     """Auto-enroll the first /start user as the owner and persist."""
     owner_id = str(user_id)
     os.environ["TELEGRAM_OWNER_ID"] = owner_id
-    env_path = WORKING_DIR / ".env"
+    env_path = ENV_FILE
     if env_path.exists():
         existing = env_path.read_text()
         if "TELEGRAM_OWNER_ID" not in existing:
@@ -3394,7 +3585,7 @@ def run_bot():
         gs.wake.set()
         _reply(
             message,
-            "Paused (removed context/GO.md). GOAL.md unchanged. /resume to run again.",
+            f"Paused (removed {_path_for_display(GO_FLAG_FILE)}). GOAL.md unchanged. /resume to run again.",
         )
         _log("agent paused via /pause (GO.md removed)")
 
@@ -3411,7 +3602,7 @@ def run_bot():
         if GO_FLAG_FILE.exists():
             _reply(
                 message,
-                "Already resumed: context/GO.md is already present, so the loop is enabled.",
+                f"Already resumed: {_path_for_display(GO_FLAG_FILE)} is already present, so the loop is enabled.",
             )
             _log("agent /resume ignored (GO.md already present)")
             return
@@ -3426,7 +3617,7 @@ def run_bot():
         _ensure_agent_thread()
         _reply(
             message,
-            "Resumed: created context/GO.md and woke the agent loop.",
+            f"Resumed: created {_path_for_display(GO_FLAG_FILE)} and woke the agent loop.",
         )
         _log("agent resumed via /resume (GO.md created)")
 
@@ -3627,7 +3818,7 @@ def run_bot():
         try:
             r = subprocess.run(
                 ["git", "pull", "--ff-only"],
-                cwd=WORKING_DIR, capture_output=True, text=True, timeout=30,
+                cwd=CODE_DIR, capture_output=True, text=True, timeout=30,
             )
             output = (r.stdout.strip() + "\n" + r.stderr.strip()).strip()
             if r.returncode != 0:
@@ -3657,7 +3848,7 @@ def run_bot():
         downloaded = bot.download_file(file_info.file_path)
 
         ext = file_info.file_path.rsplit(".", 1)[-1] if "." in file_info.file_path else "ogg"
-        tmp_path = WORKING_DIR / f"_voice_tmp.{ext}"
+        tmp_path = PROJECT_DIR / f"_voice_tmp.{ext}"
         tmp_path.write_bytes(downloaded)
 
         try:
@@ -3935,35 +4126,37 @@ def _clear_agent_runtime_history() -> None:
 
 
 def _kill_stale_claude_procs():
-    """Kill any leftover claude processes from a previous arbos instance."""
-    my_pid = os.getpid()
+    """Kill leftover Claude subprocesses recorded for this project only."""
+    if not CLAUDE_INVOCATIONS_FILE.exists():
+        return
     try:
-        result = subprocess.run(
-            ["pgrep", "-x", "claude"], capture_output=True, text=True, timeout=5,
-        )
-        for line in result.stdout.strip().splitlines():
-            pid = int(line.strip())
-            if pid == my_pid:
-                continue
-            try:
-                os.kill(pid, signal.SIGKILL)
-                _log(f"killed stale claude orphan pid={pid}")
-            except ProcessLookupError:
-                pass
-            except PermissionError:
-                pass
-    except Exception:
-        pass
+        payload = json.loads(CLAUDE_INVOCATIONS_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    for item in payload.get("items", []):
+        if item.get("status") != "running":
+            continue
+        pid = int(item.get("pid") or 0)
+        if not pid or pid == os.getpid():
+            continue
+        if not _pid_looks_like_claude(pid):
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+            _log(f"killed stale claude pid={pid} for project {PROJECT_NAME}")
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            pass
 
 
 def _send_cli(args: list[str]):
-    """CLI entry point: python arbos.py send 'message' [--file path]
+    """CLI entry point: arbos -p <project> send 'message' [--file path]
 
     Within a step, all sends are consolidated into a single Telegram message.
     The first send creates it; subsequent sends edit it by appending.
-    Uses context/.step_msg for the active step bubble.
+    Uses the active project's .step_msg file for the active step bubble.
     """
-    import argparse
     parser = argparse.ArgumentParser(description="Send a Telegram message to the operator")
     parser.add_argument("message", nargs="?", help="Message text to send")
     parser.add_argument("--file", help="Send contents of a file instead")
@@ -4027,13 +4220,12 @@ def _send_cli(args: list[str]):
             log_chat("bot", text[:1000])
             print(f"Sent ({len(text)} chars)")
         else:
-            print("Failed to send (check TAU_BOT_TOKEN and chat_id.txt)", file=sys.stderr)
+            print(f"Failed to send (check TAU_BOT_TOKEN and {CHAT_ID_FILE})", file=sys.stderr)
             sys.exit(1)
 
 
 def _sendfile_cli(args: list[str]):
-    """CLI entry point: python arbos.py sendfile path/to/file [--caption 'text'] [--photo]"""
-    import argparse
+    """CLI entry point: arbos -p <project> sendfile path/to/file [--caption 'text'] [--photo]"""
     parser = argparse.ArgumentParser(description="Send a file to the operator via Telegram")
     parser.add_argument("path", help="Path to the file to send")
     parser.add_argument("--caption", default="", help="Caption for the file")
@@ -4053,50 +4245,78 @@ def _sendfile_cli(args: list[str]):
     if ok:
         print(f"Sent {'photo' if parsed.photo else 'file'}: {file_path.name}")
     else:
-        print("Failed to send (check TAU_BOT_TOKEN and chat_id.txt)", file=sys.stderr)
+        print(f"Failed to send (check TAU_BOT_TOKEN and {CHAT_ID_FILE})", file=sys.stderr)
         sys.exit(1)
 
 
+def _parse_global_cli(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "-p",
+        "--project",
+        default=os.environ.get("ARBOS_PROJECT") or "default",
+        help="Project name or path. Simple names resolve under context/<project>.",
+    )
+    return parser.parse_known_args(argv)
+
+
+def _configure_runtime(project_arg: str | None) -> None:
+    _apply_instance_paths(_build_instance_paths(project_arg))
+    PROJECT_DIR.mkdir(parents=True, exist_ok=True)
+    WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+    os.environ["ARBOS_PROJECT"] = PROJECT_NAME
+    os.environ["ARBOS_PROJECT_DIR"] = str(PROJECT_DIR)
+    os.environ["ARBOS_CONTEXT_DIR"] = str(CONTEXT_DIR)
+    os.environ["ARBOS_WORKSPACE_DIR"] = str(WORKSPACE_DIR)
+    _init_env()
+    _reload_runtime_config()
+    _reload_env_secrets()
+
+
 def main() -> None:
-    if len(sys.argv) > 1 and sys.argv[1] == "send":
-        _send_cli(sys.argv[2:])
+    global_args, remaining = _parse_global_cli(sys.argv[1:])
+    _configure_runtime(global_args.project)
+
+    if remaining and remaining[0] == "send":
+        _send_cli(remaining[1:])
         return
 
-    if len(sys.argv) > 1 and sys.argv[1] == "sendfile":
-        _sendfile_cli(sys.argv[2:])
+    if remaining and remaining[0] == "sendfile":
+        _sendfile_cli(remaining[1:])
         return
 
-    if len(sys.argv) > 1 and sys.argv[1] == "encrypt":
-        env_path = WORKING_DIR / ".env"
-        if not env_path.exists():
+    if remaining and remaining[0] == "encrypt":
+        if not ENV_FILE.exists():
             if ENV_ENC_FILE.exists():
                 print(".env.enc already exists (already encrypted)")
             else:
                 print(".env not found, nothing to encrypt")
             return
-        load_dotenv(env_path)
         bot_token = os.environ.get("TAU_BOT_TOKEN", "")
         if not bot_token:
             print("TAU_BOT_TOKEN must be set in .env", file=sys.stderr)
             sys.exit(1)
         _encrypt_env_file(bot_token)
         print("Encrypted .env → .env.enc, deleted plaintext.")
-        print(f"On future starts: TAU_BOT_TOKEN='{bot_token}' python arbos.py")
+        print(f"On future starts: TAU_BOT_TOKEN='{bot_token}' arbos -p {PROJECT_NAME}")
         return
 
-    if len(sys.argv) > 1 and sys.argv[1] not in ("send", "encrypt", "sendfile"):
-        print(f"Unknown subcommand: {sys.argv[1]}", file=sys.stderr)
-        print("Usage: arbos.py [send|sendfile|encrypt]", file=sys.stderr)
+    if remaining:
+        print(f"Unknown subcommand: {remaining[0]}", file=sys.stderr)
+        print("Usage: arbos [-p PROJECT] [send|sendfile|encrypt]", file=sys.stderr)
         sys.exit(1)
 
     global _arbos_boot_wall
     _arbos_boot_wall = time.time()
     _operator_set("supervising", "Arbos starting (health HTTP, agent loop, Telegram)")
 
-    _log(f"arbos starting in {WORKING_DIR} (openrouter, model={CLAUDE_MODEL})")
+    _log(
+        f"arbos starting for project={PROJECT_NAME} dir={PROJECT_DIR} workspace={WORKSPACE_DIR} "
+        f"(openrouter, model={CLAUDE_MODEL})"
+    )
     _kill_stale_claude_procs()
-    _reload_env_secrets()
     CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
+    WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     CONTEXT_LOGS_DIR.mkdir(parents=True, exist_ok=True)
     CHATLOG_DIR.mkdir(parents=True, exist_ok=True)

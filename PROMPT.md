@@ -53,7 +53,7 @@ Your prompt is built from these sources:
 
 The loop runs while `{{ARBOS_CONTEXT_DIR}}/GOAL.md` is non-empty and the agent is **started** and not **paused**. Runtime flags live in `{{ARBOS_CONTEXT_DIR}}/meta.json` (managed by Arbos; do not edit unless you have a clear reason).
 
-**Telegram (operator)** — goal loop: `/loop <description>` (sets the goal and starts the loop), `/pause`, `/resume`, `/clear` (wipes goal files and resets loop state), `/delay <minutes>` between successful steps. Other: `/start` (owner registration / help pointer), `/help`, `/status` (text snapshot; JSON also at [http://127.0.0.1:{{ARBOS_HEALTH_PORT}}/health](http://127.0.0.1:{{ARBOS_HEALTH_PORT}}/health)), `/restart`, `/update`. Voice notes are not transcribed; use text, photos, or documents.
+**Telegram (operator)** — goal loop: `/loop <description>` (sets the goal and starts the loop), `/pause`, `/resume`, `/clear` (wipes goal files and resets loop state), `/delay <minutes>` between successful steps. Other: `/start` (owner registration / help pointer), `/help`, `/status` (text snapshot; JSON also at [http://127.0.0.1:{{ARBOS_HEALTH_PORT}}/health](http://127.0.0.1:{{ARBOS_HEALTH_PORT}}/health)), `/model <provider/model>` (sets the project-local default model), `/restart`, `/update`. Voice notes are not transcribed; use text, photos, or documents.
 
 After each step, artifacts are saved to `{{ARBOS_CONTEXT_DIR}}/runs/<timestamp>/`. Each Claude attempt also has invocation metadata at `{{ARBOS_CONTEXT_DIR}}/runs/<timestamp>/invocation-<attempt>.json`.
 

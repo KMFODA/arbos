@@ -1,13 +1,16 @@
 import argparse
 import base64
+import io
 import json
 import os
 import selectors
 import signal
+import shutil
 import subprocess
 import sys
 import time
 import threading
+import fcntl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from datetime import datetime
@@ -18,7 +21,7 @@ from uuid import uuid4
 import hashlib
 import re
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv, dotenv_values
 import requests
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -27,9 +30,42 @@ from cryptography.hazmat.primitives import hashes
 CODE_DIR = Path(__file__).resolve().parent
 PROMPT_FILE = CODE_DIR / "PROMPT.md"
 PROJECTS_ROOT = CODE_DIR / "context"
+LOCKS_ROOT = PROJECTS_ROOT / ".locks"
+TOKEN_LOCKS_ROOT = LOCKS_ROOT / "tokens"
+INSTANCE_LOCKS_ROOT = LOCKS_ROOT / "instances"
+PM2_NAME_FILENAME = ".pm2-name"
+LAUNCH_SCRIPT_NAME = ".arbos-launch.sh"
+BOT_USERNAME_ENV = "ARBOS_BOT_USERNAME"
 ARBOS_STEP_STREAM_ID_ENV = "ARBOS_STEP_STREAM_ID"
 STATE_AUTOSYNC_START = "<!-- ARBOS_STATE_AUTOSYNC_START -->"
 STATE_AUTOSYNC_END = "<!-- ARBOS_STATE_AUTOSYNC_END -->"
+
+FORK_SHARED_ENV_KEYS = (
+    "OPENROUTER_API_KEY",
+    "CLAUDE_MODEL",
+    "CLAUDE_MAX_RETRIES",
+    "CLAUDE_TIMEOUT",
+    "AGENT_DELAY",
+)
+
+DEFAULT_CLAUDE_MODEL = "openai/gpt-5.4"
+
+
+@dataclass(frozen=True)
+class BotIdentity:
+    username: str
+    bot_id: int | None = None
+    display_name: str = ""
+
+
+@dataclass(frozen=True)
+class BootstrapResult:
+    identity: BotIdentity
+    project_dir: Path
+    env_file: Path
+    pm2_name: str
+    launch_script: Path
+    health_port: int
 
 
 @dataclass(frozen=True)
@@ -170,7 +206,7 @@ def _apply_instance_paths(paths: InstancePaths) -> None:
 
 
 HEALTH_PORT = 0
-CLAUDE_MODEL = "anthropic/claude-opus-4.6"
+CLAUDE_MODEL = DEFAULT_CLAUDE_MODEL
 LLM_API_KEY = ""
 LLM_BASE_URL = "https://openrouter.ai/api"
 IS_ROOT = os.getuid() == 0
@@ -184,6 +220,310 @@ def _default_health_port(project_name: str) -> int:
     return 8200 + (int(digest[:4], 16) % 2000)
 
 
+def _sanitize_instance_name(raw: str) -> str:
+    text = (raw or "").strip().lstrip("@").lower()
+    text = re.sub(r"[^a-z0-9_]+", "-", text)
+    text = re.sub(r"-{2,}", "-", text).strip("-")
+    if not text:
+        raise ValueError("Could not derive a valid bot username for this token.")
+    return text
+
+
+def _pm2_name_for_instance(instance_name: str) -> str:
+    return f"arbos-{instance_name}"
+
+
+def _launch_script_path(project_dir: Path) -> Path:
+    return project_dir / LAUNCH_SCRIPT_NAME
+
+
+def _pm2_name_file(project_dir: Path) -> Path:
+    return project_dir / PM2_NAME_FILENAME
+
+
+def _bot_identity_from_env() -> str:
+    raw = os.environ.get(BOT_USERNAME_ENV, "").strip()
+    return _sanitize_instance_name(raw) if raw else ""
+
+
+def _resolve_bot_identity(bot_token: str) -> BotIdentity:
+    token = (bot_token or "").strip()
+    if not token:
+        raise ValueError("Telegram bot token is required.")
+    try:
+        response = requests.get(
+            f"https://api.telegram.org/bot{token}/getMe",
+            timeout=15,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except Exception as exc:
+        raise RuntimeError(f"Failed to resolve Telegram bot identity: {type(exc).__name__}") from exc
+    ok, desc = _telegram_result_ok(data)
+    if not ok:
+        raise RuntimeError(f"Telegram getMe failed: {desc[:160]}")
+    result = data.get("result") or {}
+    username = _sanitize_instance_name(str(result.get("username") or ""))
+    display_name = str(result.get("first_name") or username)
+    bot_id = result.get("id")
+    try:
+        bot_id = int(bot_id) if bot_id is not None else None
+    except (TypeError, ValueError):
+        bot_id = None
+    return BotIdentity(username=username, bot_id=bot_id, display_name=display_name)
+
+
+def _lock_path(root: Path, key: str) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return root / f"{digest}.lock"
+
+
+def _acquire_singleton_lock(root: Path, key: str, label: str):
+    lock_path = _lock_path(root, key)
+    fh = open(lock_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        fh.close()
+        raise RuntimeError(f"Another Arbos process is already using this {label}.") from exc
+    fh.seek(0)
+    fh.truncate()
+    fh.write(json.dumps({
+        "pid": os.getpid(),
+        "label": label,
+        "instance": PROJECT_DIR.name if 'PROJECT_DIR' in globals() else "",
+        "ts": datetime.now().isoformat(),
+    }, indent=2))
+    fh.flush()
+    return fh
+
+
+def _write_env_value_lines(path: Path, values: dict[str, str], comments: dict[str, str] | None = None) -> None:
+    existing_lines: list[str] = []
+    if path.exists():
+        existing_lines = path.read_text().splitlines()
+    out = list(existing_lines)
+    for key, value in values.items():
+        desc = (comments or {}).get(key, key.replace("_", " ").lower())
+        value_line = f'{key}="{_dotenv_double_quote_value(value)}"'
+        out = _apply_env_key_comment_block(out, key, value_line, desc)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(out).rstrip() + "\n")
+    os.chmod(path, 0o600)
+
+
+def _load_project_env_map(project_dir: Path, *, token_hint: str = "") -> dict[str, str]:
+    env_file = project_dir / ".env"
+    if env_file.exists():
+        return {
+            str(k): str(v).strip()
+            for k, v in dotenv_values(env_file).items()
+            if k and v is not None
+        }
+    env_enc = project_dir / ".env.enc"
+    if env_enc.exists():
+        token = token_hint.strip()
+        if not token:
+            return {}
+        f = Fernet(_derive_fernet_key(token))
+        try:
+            content = f.decrypt(env_enc.read_bytes()).decode()
+        except InvalidToken:
+            return {}
+        return {
+            str(k): str(v).strip()
+            for k, v in dotenv_values(stream=io.StringIO(content)).items()
+            if k and v is not None
+        }
+    return {}
+
+
+def _iter_context_dirs() -> list[Path]:
+    if not PROJECTS_ROOT.exists():
+        return []
+    return sorted(
+        [
+            path
+            for path in PROJECTS_ROOT.iterdir()
+            if path.is_dir() and not path.name.startswith(".")
+        ]
+    )
+
+
+def _find_projects_for_token(bot_token: str) -> list[Path]:
+    matches: list[Path] = []
+    token = (bot_token or "").strip()
+    if not token:
+        return matches
+    for project_dir in _iter_context_dirs():
+        env_map = _load_project_env_map(project_dir, token_hint=token)
+        if env_map.get("TAU_BOT_TOKEN", "").strip() == token:
+            matches.append(project_dir)
+    return matches
+
+
+def _collect_env_from_map(env_map: dict[str, str]) -> dict[str, str]:
+    shared: dict[str, str] = {}
+    for key in FORK_SHARED_ENV_KEYS:
+        value = env_map.get(key, "").strip()
+        if value:
+            shared[key] = value
+    return shared
+
+
+def _project_env_values(project_dir: Path, *, bot_token: str, openrouter_api_key: str = "", owner_id: str = "", health_port: int | None = None, bot_username: str = "", extra_env: dict[str, str] | None = None) -> dict[str, str]:
+    env_map: dict[str, str] = {}
+    if extra_env:
+        for key, value in extra_env.items():
+            if value:
+                env_map[key] = value
+    if openrouter_api_key:
+        env_map["OPENROUTER_API_KEY"] = openrouter_api_key
+    if health_port is not None:
+        env_map["ARBOS_HEALTH_PORT"] = str(health_port)
+    env_map["TAU_BOT_TOKEN"] = bot_token
+    if owner_id:
+        env_map["TELEGRAM_OWNER_ID"] = owner_id
+    if bot_username:
+        env_map[BOT_USERNAME_ENV] = bot_username
+        env_map["ARBOS_PROJECT"] = bot_username
+    return env_map
+
+
+def _project_env_comments() -> dict[str, str]:
+    return {
+        "OPENROUTER_API_KEY": "OpenRouter API key",
+        "ARBOS_HEALTH_PORT": "Local health port for this bot instance",
+        "TAU_BOT_TOKEN": "Telegram bot token for this instance",
+        "TELEGRAM_OWNER_ID": "Telegram user id allowed to control this bot",
+        BOT_USERNAME_ENV: "Canonical Telegram bot username for this instance",
+        "ARBOS_PROJECT": "Canonical Arbos project name for this instance",
+        "CLAUDE_MODEL": "Claude model override",
+        "CLAUDE_MAX_RETRIES": "Claude retry limit",
+        "CLAUDE_TIMEOUT": "Claude idle timeout",
+        "AGENT_DELAY": "Additional delay between loop steps",
+    }
+
+
+def _init_project_layout(project_dir: Path) -> None:
+    workspace_dir = project_dir / "workspace"
+    for path in (
+        project_dir / "runs",
+        project_dir / "chat",
+        project_dir / "files",
+        project_dir / "logs",
+        project_dir / ".claude",
+        workspace_dir,
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+    for path in (
+        project_dir / "GOAL.md",
+        project_dir / "STATE.md",
+        project_dir / "INBOX.md",
+    ):
+        path.touch(exist_ok=True)
+
+
+def _seed_workspace_defaults(workspace_dir: Path) -> None:
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("agcli", "taocli"):
+        source = CODE_DIR / name
+        if not source.exists():
+            continue
+        target = workspace_dir / name
+        if target.exists():
+            continue
+        shutil.move(str(source), str(target))
+
+
+def _copy_workspace_snapshot(source_dir: Path, target_dir: Path) -> None:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for child in source_dir.iterdir():
+        dest = target_dir / child.name
+        if dest.exists():
+            continue
+        if child.is_dir():
+            shutil.copytree(child, dest, symlinks=True)
+        else:
+            shutil.copy2(child, dest)
+
+
+def _write_launch_script(project_dir: Path) -> Path:
+    launch_script = _launch_script_path(project_dir)
+    launch_script.write_text(
+        "#!/usr/bin/env bash\n"
+        'export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.npm-global/bin:/usr/local/bin:$PATH"\n'
+        'SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"\n'
+        'ARBOS_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"\n'
+        'cd "$SCRIPT_DIR"\n'
+        'set -a; [ -f ".env" ] && source ".env"; set +a\n'
+        'source "$ARBOS_ROOT/.venv/bin/activate"\n'
+        'exec "$ARBOS_ROOT/.venv/bin/python" "$ARBOS_ROOT/arbos.py" -p "$SCRIPT_DIR" 2>&1\n'
+    )
+    os.chmod(launch_script, 0o755)
+    return launch_script
+
+
+def _pm2_bin() -> str | None:
+    candidates = [
+        shutil.which("pm2"),
+        str(Path.home() / ".npm-global" / "lib" / "node_modules" / "pm2" / "bin" / "pm2"),
+        str(Path.home() / ".npm-global" / "bin" / "pm2"),
+        str(Path.home() / ".local" / "bin" / "pm2"),
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return candidate
+    return None
+
+
+def _pm2_describe(name: str) -> bool:
+    pm2_bin = _pm2_bin()
+    if not pm2_bin:
+        return False
+    result = subprocess.run(
+        [pm2_bin, "describe", name],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    return result.returncode == 0
+
+
+def _start_pm2_project(project_dir: Path, instance_name: str) -> str:
+    pm2_bin = _pm2_bin()
+    if not pm2_bin:
+        raise RuntimeError("pm2 is not installed or not available on PATH.")
+    pm2_name = _pm2_name_for_instance(instance_name)
+    launch_script = _write_launch_script(project_dir)
+    if _pm2_describe(pm2_name):
+        subprocess.run([pm2_bin, "delete", pm2_name], capture_output=True, text=True, timeout=30)
+    subprocess.run(
+        [
+            pm2_bin,
+            "start",
+            str(launch_script),
+            "--name",
+            pm2_name,
+            "--cwd",
+            str(project_dir),
+            "--log",
+            str(project_dir / "logs" / "arbos.log"),
+            "--time",
+            "--restart-delay",
+            "10000",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+    subprocess.run([pm2_bin, "save"], capture_output=True, text=True, timeout=30)
+    _pm2_name_file(project_dir).write_text(pm2_name + "\n")
+    return pm2_name
+
+
 def _reload_runtime_config() -> None:
     global HEALTH_PORT, CLAUDE_MODEL, LLM_API_KEY, MAX_RETRIES, CLAUDE_TIMEOUT
     global CLAUDE_IDLE_KILL
@@ -193,7 +533,7 @@ def _reload_runtime_config() -> None:
         or os.environ.get("PROXY_PORT")
         or str(_default_health_port(PROJECT_NAME))
     )
-    CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "anthropic/claude-opus-4.6")
+    CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL)
     LLM_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
     try:
         MAX_RETRIES = int(os.environ.get("CLAUDE_MAX_RETRIES", "5"))
@@ -207,6 +547,38 @@ def _reload_runtime_config() -> None:
         timeout = 600
     CLAUDE_TIMEOUT = timeout
     CLAUDE_IDLE_KILL = CLAUDE_TIMEOUT > 0
+
+
+def _runtime_instance_name() -> str:
+    bot_name = _bot_identity_from_env()
+    if bot_name:
+        return bot_name
+    token = os.environ.get("TAU_BOT_TOKEN", "").strip()
+    if not token:
+        return PROJECT_DIR.name
+    identity = _resolve_bot_identity(token)
+    os.environ[BOT_USERNAME_ENV] = identity.username
+    return identity.username
+
+
+def _validate_runtime_identity() -> None:
+    expected_name = _runtime_instance_name()
+    actual_name = PROJECT_DIR.name
+    if expected_name and actual_name != expected_name:
+        raise RuntimeError(
+            f"Context directory must match the bot username: expected `{expected_name}`, got `{actual_name}`. "
+            "Run `arbos -p <current-project> migrate-bot-names` first."
+        )
+
+
+def _acquire_runtime_singleton_locks() -> None:
+    global _token_lock_fh, _instance_lock_fh
+    token = os.environ.get("TAU_BOT_TOKEN", "").strip()
+    instance_name = _runtime_instance_name()
+    if token:
+        _token_lock_fh = _acquire_singleton_lock(TOKEN_LOCKS_ROOT, token, "Telegram bot token")
+    if instance_name:
+        _instance_lock_fh = _acquire_singleton_lock(INSTANCE_LOCKS_ROOT, instance_name, "bot identity")
 
 # ── Encrypted .env ───────────────────────────────────────────────────────────
 
@@ -381,6 +753,8 @@ _tls = threading.local()
 _log_lock = threading.Lock()
 _chatlog_lock = threading.Lock()
 _pending_env_lock = threading.Lock()
+_token_lock_fh = None
+_instance_lock_fh = None
 
 _ENV_KEY_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _MAX_TELEGRAM_ENV_KEY_LEN = 128
@@ -477,6 +851,114 @@ def _persist_env_var_with_comment(key: str, value: str, description: str) -> tup
         _reload_env_secrets()
 
     return True, f"Saved `{key}` with comment (value not shown). Active in this process."
+
+
+def _collect_new_env() -> dict[str, str]:
+    env_map: dict[str, str] = {}
+    for key in FORK_SHARED_ENV_KEYS:
+        value = os.environ.get(key, "").strip()
+        if value:
+            env_map[key] = value
+    return env_map
+
+
+def _migrate_project_dir(
+    source_dir: Path,
+    *,
+    bot_token: str,
+    owner_id: str = "",
+    openrouter: str = "",
+    no_start: bool = False,
+) -> BootstrapResult:
+    env_values = _load_project_env_map(source_dir, token_hint=bot_token)
+    owner = owner_id.strip() or env_values.get("TELEGRAM_OWNER_ID", "").strip()
+    openrouter_key = openrouter.strip() or env_values.get("OPENROUTER_API_KEY", "").strip()
+    identity = _resolve_bot_identity(bot_token)
+    canonical_dir = PROJECTS_ROOT / identity.username
+    if canonical_dir.exists() and canonical_dir != source_dir:
+        raise FileExistsError(f"Target context already exists: {canonical_dir}")
+
+    old_pm2_name = ""
+    pm2_name_file = _pm2_name_file(source_dir)
+    if pm2_name_file.exists():
+        old_pm2_name = pm2_name_file.read_text().strip()
+
+    if canonical_dir != source_dir:
+        shutil.move(str(source_dir), str(canonical_dir))
+
+    _init_project_layout(canonical_dir)
+    raw_health = env_values.get("ARBOS_HEALTH_PORT", "").strip()
+    health_port = int(raw_health) if raw_health.isdigit() and int(raw_health) > 0 else _default_health_port(identity.username)
+    extra_env = _collect_env_from_map(env_values)
+    env_map = _project_env_values(
+        canonical_dir,
+        bot_token=bot_token,
+        openrouter_api_key=openrouter_key,
+        owner_id=owner,
+        health_port=health_port,
+        bot_username=identity.username,
+        extra_env=extra_env,
+    )
+    _write_env_value_lines(canonical_dir / ".env", env_map, _project_env_comments())
+
+    new_pm2_name = _pm2_name_for_instance(identity.username)
+    if old_pm2_name and old_pm2_name != new_pm2_name and _pm2_describe(old_pm2_name):
+        pm2_bin = _pm2_bin()
+        subprocess.run([pm2_bin, "delete", old_pm2_name], capture_output=True, text=True, timeout=30)
+    _write_launch_script(canonical_dir)
+    _pm2_name_file(canonical_dir).write_text(new_pm2_name + "\n")
+    if not no_start:
+        new_pm2_name = _start_pm2_project(canonical_dir, identity.username)
+    return BootstrapResult(
+        identity=identity,
+        project_dir=canonical_dir,
+        env_file=canonical_dir / ".env",
+        pm2_name=new_pm2_name or _pm2_name_for_instance(identity.username),
+        launch_script=_launch_script_path(canonical_dir),
+        health_port=health_port,
+    )
+
+
+def _create_new_project(new_bot_token: str) -> BootstrapResult:
+    token = (new_bot_token or "").strip()
+    current_token = os.environ.get("TAU_BOT_TOKEN", "").strip()
+    if not token:
+        raise ValueError("Usage: /new <bot token>")
+    if current_token and token == current_token:
+        raise ValueError("New bot token must be different from the current bot token.")
+    identity = _resolve_bot_identity(token)
+    project_dir = PROJECTS_ROOT / identity.username
+    if project_dir.exists():
+        raise FileExistsError(f"Context already exists for @{identity.username}.")
+    if _pm2_describe(_pm2_name_for_instance(identity.username)):
+        raise FileExistsError(f"pm2 process already exists for @{identity.username}.")
+    try:
+        _init_project_layout(project_dir)
+        extra_env = _collect_new_env()
+        owner_id = os.environ.get("TELEGRAM_OWNER_ID", "").strip()
+        health_port = _default_health_port(identity.username)
+        env_map = _project_env_values(
+            project_dir,
+            bot_token=token,
+            owner_id=owner_id,
+            health_port=health_port,
+            bot_username=identity.username,
+            extra_env=extra_env,
+        )
+        _write_env_value_lines(project_dir / ".env", env_map, _project_env_comments())
+        pm2_name = _start_pm2_project(project_dir, identity.username)
+        return BootstrapResult(
+            identity=identity,
+            project_dir=project_dir,
+            env_file=project_dir / ".env",
+            pm2_name=pm2_name,
+            launch_script=_launch_script_path(project_dir),
+            health_port=health_port,
+        )
+    except Exception:
+        if project_dir.exists():
+            shutil.rmtree(project_dir, ignore_errors=True)
+        raise
 
 
 _shutdown = threading.Event()
@@ -878,10 +1360,11 @@ _ARBOS_ENV_BUILTIN_DOC: dict[str, str] = {
     "ARBOS_WORKSPACE_DIR": "Project workspace subdirectory for checked-out repos and coding work.",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "Claude Code setting to reduce background traffic.",
     "CLAUDE_MAX_RETRIES": "Retries when a Claude run fails.",
-    "CLAUDE_MODEL": "Model id for Claude Code (e.g. anthropic/claude-opus-4.6).",
+    "CLAUDE_MODEL": f"Model id for Claude Code (default: {DEFAULT_CLAUDE_MODEL}).",
     "CLAUDE_TIMEOUT": "Idle watchdog timeout in seconds for Claude runs; 0 disables.",
     "OPENROUTER_API_KEY": "OpenRouter API key (loaded into the agent as ANTHROPIC_API_KEY).",
     "PROXY_PORT": "Fallback for health port if ARBOS_HEALTH_PORT is unset.",
+    BOT_USERNAME_ENV: "Canonical Telegram bot username for this Arbos instance.",
     "TAU_BOT_TOKEN": "Telegram bot token (Arbos host only; not passed to the coding agent subprocess).",
     "TELEGRAM_OWNER_ID": "Telegram user id allowed to control the bot.",
 }
@@ -1395,6 +1878,8 @@ Arbos:
 - /force
 - /clear
 - /delay <mins>
+- /model [provider/model]
+- /new <bot_token>
 - /restart
 - /env KEY VAL DESC
 """
@@ -3677,6 +4162,47 @@ def run_bot():
         _reply(message, f"Delay set to {minutes} minute(s) between successful steps.")
         _log(f"delay set to {minutes}m via /delay")
 
+    @bot.message_handler(commands=["model"])
+    def handle_model(message):
+        uid = message.from_user.id if message.from_user else None
+        if not _is_owner(uid):
+            _reject(message)
+            return
+        _save_operator_telegram(message)
+        parts = (message.text or "").split(None, 1)
+        if len(parts) < 2 or not parts[1].strip():
+            override = os.environ.get("CLAUDE_MODEL", "").strip()
+            source = "project override" if override else "built-in default"
+            _reply(
+                message,
+                "\n".join([
+                    f"Current model: `{CLAUDE_MODEL}`",
+                    f"Source: {source}",
+                    f"Built-in default: `{DEFAULT_CLAUDE_MODEL}`",
+                    "Usage: /model <provider/model>",
+                ]),
+            )
+            return
+        model = " ".join(parts[1].split()).strip()
+        if not model or any(ch.isspace() for ch in model):
+            _reply(message, "Usage: /model <provider/model> (no spaces)")
+            return
+        ok, msg = _persist_env_var_with_comment(
+            "CLAUDE_MODEL",
+            model,
+            "Default model for this bot/project.",
+        )
+        if not ok:
+            _reply(message, f"Error: {msg}")
+            return
+        _reload_runtime_config()
+        _write_claude_settings()
+        _reply(
+            message,
+            f"Default model for this project is now `{CLAUDE_MODEL}`. New steps will use it.",
+        )
+        _log(f"/model set CLAUDE_MODEL={CLAUDE_MODEL!r}")
+
     @bot.message_handler(commands=["env"])
     def handle_env(message):
         uid = message.from_user.id if message.from_user else None
@@ -3701,6 +4227,49 @@ def run_bot():
                 bot.delete_message(message.chat.id, message.message_id)
             except Exception as exc:
                 _log(f"/env: could not delete operator message (token may remain in chat): {exc!r}")
+
+    @bot.message_handler(commands=["new"])
+    def handle_new(message):
+        uid = message.from_user.id if message.from_user else None
+        if not _is_owner(uid):
+            _reject(message)
+            return
+        _save_operator_telegram(message)
+        parts = (message.text or "").split(None, 1)
+        if len(parts) < 2 or not parts[1].strip():
+            _reply(message, "Usage: /new <bot token>")
+            return
+        new_token = parts[1].strip()
+        try:
+            result = _create_new_project(new_token)
+        except Exception as exc:
+            try:
+                bot.delete_message(message.chat.id, message.message_id)
+            except Exception as delete_exc:
+                _log(f"/new: could not delete operator message after failure: {delete_exc!r}")
+            _reply(
+                message,
+                _truncate_telegram_text(f"New bot failed: {_redact_secrets(str(exc))[:800]}"),
+            )
+            _log(f"/new failed: {type(exc).__name__}: {_redact_secrets(str(exc))[:200]}")
+            return
+        try:
+            bot.delete_message(message.chat.id, message.message_id)
+        except Exception as exc:
+            _log(f"/new: could not delete operator message: {exc!r}")
+        _reply(
+            message,
+            "\n".join([
+                f"Created @{result.identity.username}.",
+                f"Chat: https://t.me/{result.identity.username}",
+                f"Context: {_path_for_display(result.project_dir)}",
+                f"Workspace: {_path_for_display(result.project_dir / 'workspace')}",
+                f"PM2: {result.pm2_name}",
+                f"Health: http://127.0.0.1:{result.health_port}/health",
+                "Fresh workspace created. Same owner copied. Open the new bot chat and send /start, then /loop ...",
+            ]),
+        )
+        _log(f"/new created @{result.identity.username} pm2={result.pm2_name}")
 
     @bot.message_handler(commands=["loop"])
     def handle_loop(message):
@@ -4249,6 +4818,114 @@ def _sendfile_cli(args: list[str]):
         sys.exit(1)
 
 
+def _bot_name_cli(args: list[str]) -> None:
+    parser = argparse.ArgumentParser(description="Resolve a Telegram bot username from a token")
+    parser.add_argument("--bot-token", default=os.environ.get("TAU_BOT_TOKEN", ""))
+    parsed = parser.parse_args(args)
+    if not parsed.bot_token.strip():
+        print("bot token is required", file=sys.stderr)
+        sys.exit(1)
+    identity = _resolve_bot_identity(parsed.bot_token)
+    print(identity.username)
+
+
+def _bootstrap_project_cli(args: list[str]) -> None:
+    parser = argparse.ArgumentParser(description="Create or update a bot-named Arbos project")
+    parser.add_argument("--bot-token", default=os.environ.get("TAU_BOT_TOKEN", ""))
+    parser.add_argument("--openrouter-api-key", default=os.environ.get("OPENROUTER_API_KEY", ""))
+    parser.add_argument("--owner-id", default=os.environ.get("TELEGRAM_OWNER_ID", ""))
+    parser.add_argument("--health-port", type=int, default=0)
+    parser.add_argument("--copy-workspace-from", default="")
+    parser.add_argument("--no-start", action="store_true")
+    parsed = parser.parse_args(args)
+
+    token = parsed.bot_token.strip()
+    if not token:
+        print("bot token is required", file=sys.stderr)
+        sys.exit(1)
+    identity = _resolve_bot_identity(token)
+    project_dir = PROJECTS_ROOT / identity.username
+    legacy_matches = [path for path in _find_projects_for_token(token) if path != project_dir]
+    if not project_dir.exists() and len(legacy_matches) == 1:
+        result = _migrate_project_dir(
+            legacy_matches[0],
+            bot_token=token,
+            owner_id=parsed.owner_id.strip(),
+            openrouter=parsed.openrouter_api_key.strip(),
+            no_start=parsed.no_start,
+        )
+        print(f"instance={result.identity.username}")
+        print(f"context={result.project_dir}")
+        print(f"workspace={result.project_dir / 'workspace'}")
+        print(f"health_port={result.health_port}")
+        print(f"pm2={result.pm2_name}")
+        print(f"migrated_from={legacy_matches[0]}")
+        return
+    if len(legacy_matches) > 1:
+        print("Multiple legacy contexts use this bot token; migrate manually with `arbos -p <project> migrate-bot-names`.", file=sys.stderr)
+        sys.exit(1)
+
+    project_preexisted = project_dir.exists()
+    try:
+        _init_project_layout(project_dir)
+        workspace_dir = project_dir / "workspace"
+        if parsed.copy_workspace_from.strip():
+            _copy_workspace_snapshot(Path(parsed.copy_workspace_from).expanduser().resolve(), workspace_dir)
+        else:
+            _seed_workspace_defaults(workspace_dir)
+        extra_env = {key: os.environ.get(key, "").strip() for key in FORK_SHARED_ENV_KEYS}
+        health_port = parsed.health_port if parsed.health_port > 0 else _default_health_port(identity.username)
+        env_map = _project_env_values(
+            project_dir,
+            bot_token=token,
+            openrouter_api_key=parsed.openrouter_api_key.strip(),
+            owner_id=parsed.owner_id.strip(),
+            health_port=health_port,
+            bot_username=identity.username,
+            extra_env=extra_env,
+        )
+        _write_env_value_lines(project_dir / ".env", env_map, _project_env_comments())
+        pm2_name = ""
+        if not parsed.no_start:
+            pm2_name = _start_pm2_project(project_dir, identity.username)
+        print(f"instance={identity.username}")
+        print(f"context={project_dir}")
+        print(f"workspace={workspace_dir}")
+        print(f"health_port={health_port}")
+        if pm2_name:
+            print(f"pm2={pm2_name}")
+    except Exception:
+        if not project_preexisted and project_dir.exists():
+            shutil.rmtree(project_dir, ignore_errors=True)
+        raise
+
+
+def _migrate_bot_names_cli(project_arg: str | None, args: list[str]) -> None:
+    parser = argparse.ArgumentParser(description="Rename a project context to its canonical Telegram bot username")
+    parser.add_argument("--no-start", action="store_true")
+    parsed = parser.parse_args(args)
+
+    paths = _build_instance_paths(project_arg)
+    project_dir = paths.project_dir
+    env_values = _load_project_env_map(project_dir, token_hint=os.environ.get("TAU_BOT_TOKEN", ""))
+    token = str(env_values.get("TAU_BOT_TOKEN") or os.environ.get("TAU_BOT_TOKEN", "")).strip()
+    if not token:
+        print("TAU_BOT_TOKEN is required for migration", file=sys.stderr)
+        sys.exit(1)
+    owner_id = str(env_values.get("TELEGRAM_OWNER_ID") or os.environ.get("TELEGRAM_OWNER_ID", "")).strip()
+    openrouter = str(env_values.get("OPENROUTER_API_KEY") or os.environ.get("OPENROUTER_API_KEY", "")).strip()
+    result = _migrate_project_dir(
+        project_dir,
+        bot_token=token,
+        owner_id=owner_id,
+        openrouter=openrouter,
+        no_start=parsed.no_start,
+    )
+    print(f"instance={result.identity.username}")
+    print(f"context={result.project_dir}")
+    print(f"pm2={result.pm2_name}")
+
+
 def _parse_global_cli(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument(
@@ -4269,12 +4946,23 @@ def _configure_runtime(project_arg: str | None) -> None:
     os.environ["ARBOS_CONTEXT_DIR"] = str(CONTEXT_DIR)
     os.environ["ARBOS_WORKSPACE_DIR"] = str(WORKSPACE_DIR)
     _init_env()
+    _validate_runtime_identity()
     _reload_runtime_config()
     _reload_env_secrets()
+    _acquire_runtime_singleton_locks()
 
 
 def main() -> None:
     global_args, remaining = _parse_global_cli(sys.argv[1:])
+    if remaining and remaining[0] == "bot-name":
+        _bot_name_cli(remaining[1:])
+        return
+    if remaining and remaining[0] == "bootstrap-project":
+        _bootstrap_project_cli(remaining[1:])
+        return
+    if remaining and remaining[0] == "migrate-bot-names":
+        _migrate_bot_names_cli(global_args.project, remaining[1:])
+        return
     _configure_runtime(global_args.project)
 
     if remaining and remaining[0] == "send":
@@ -4303,7 +4991,7 @@ def main() -> None:
 
     if remaining:
         print(f"Unknown subcommand: {remaining[0]}", file=sys.stderr)
-        print("Usage: arbos [-p PROJECT] [send|sendfile|encrypt]", file=sys.stderr)
+        print("Usage: arbos [-p PROJECT] [bot-name|bootstrap-project|migrate-bot-names|send|sendfile|encrypt]", file=sys.stderr)
         sys.exit(1)
 
     global _arbos_boot_wall

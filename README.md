@@ -21,7 +21,7 @@ Arbos just loops a `GOAL.md` through a coding agent.
 ## Requirements
 
 - [Telegram Bot token](https://core.telegram.org/bots#how-do-i-create-a-bot)
-- [Chutes API key](https://chutes.ai)
+- [OpenRouter API key](https://openrouter.ai/keys)
 
 ## Getting started
 
@@ -31,7 +31,9 @@ curl -fsSL https://raw.githubusercontent.com/unconst/Arbos/main/run.sh | bash
 
 ## Usage
 
-To run Arbos just set the `/goal`:
+Telegram (after `/start` to register): `/goal <description>` sets `context/GOAL.md` and **starts the loop**. Use `/pause`, `/resume`, `/delay <mins>`, and `/clear` as needed. Send `/help` for the full list.
+
+Example `/goal` body:
 ```
 /goal
 

@@ -8,9 +8,6 @@ dependencies = [
     "requests",
     "python-dotenv",
     "pyTelegramBotAPI",
-    "httpx",
-    "fastapi",
-    "uvicorn",
     "cryptography",
 ]
 

@@ -200,37 +200,9 @@ mkdir -p context/runs context/chat
 
 printf "\n"
 
-# ── 6. Choose provider ───────────────────────────────────────────────────────
-
-printf "  ${BOLD}LLM Provider${NC}\n\n"
+# ── 6. API keys ───────────────────────────────────────────────────────────────
 
 touch "$INSTALL_DIR/.env"
-
-PROVIDER=""
-if grep -q "^PROVIDER=" "$INSTALL_DIR/.env" 2>/dev/null; then
-    PROVIDER=$(grep "^PROVIDER=" "$INSTALL_DIR/.env" | head -1 | cut -d= -f2 | tr -d "' \"")
-    ok "Provider already set: $PROVIDER"
-elif [ "$HAS_TTY" = true ]; then
-    printf "  ${DIM}Pick your inference backend:${NC}\n\n"
-    printf "    ${BOLD}1)${NC} Chutes     ${DIM}— cheap multi-model pool via chutes.ai${NC}\n"
-    printf "    ${BOLD}2)${NC} OpenRouter  ${DIM}— Claude Opus 4.6 via openrouter.ai${NC}\n\n"
-    printf "  ${CYAN}Choice [1]:${NC} "
-    read -r _choice </dev/tty 2>/dev/null || _choice=""
-    case "$_choice" in
-        2) PROVIDER="openrouter" ;;
-        *) PROVIDER="chutes" ;;
-    esac
-    echo "PROVIDER=$PROVIDER" >> "$INSTALL_DIR/.env"
-    ok "Provider set to $PROVIDER"
-else
-    PROVIDER="chutes"
-    echo "PROVIDER=$PROVIDER" >> "$INSTALL_DIR/.env"
-    ok "Provider defaulted to chutes (no TTY)"
-fi
-
-printf "\n"
-
-# ── 7. API keys ──────────────────────────────────────────────────────────────
 
 printf "  ${BOLD}API Keys${NC}\n\n"
 
@@ -273,17 +245,10 @@ ask_key() {
     ok "$key_name saved"
 }
 
-if [ "$PROVIDER" = "openrouter" ]; then
-    ask_key "OPENROUTER_API_KEY" \
-        "OpenRouter API key" \
-        "Get yours at: https://openrouter.ai/keys" \
-        "required"
-else
-    ask_key "CHUTES_API_KEY" \
-        "Chutes API key" \
-        "Get yours at: https://chutes.ai — sign up and generate an API key" \
-        "required"
-fi
+ask_key "OPENROUTER_API_KEY" \
+    "OpenRouter API key" \
+    "Get yours at: https://openrouter.ai/keys" \
+    "required"
 
 printf "\n"
 
@@ -294,7 +259,7 @@ ask_key "TAU_BOT_TOKEN" \
 
 printf "\n"
 
-# ── 8. Start Arbos ───────────────────────────────────────────────────────────
+# ── 7. Start Arbos ───────────────────────────────────────────────────────────
 
 printf "  ${BOLD}Starting Arbos${NC}\n\n"
 
@@ -334,36 +299,29 @@ fi
 # Stop existing instance if running
 pm2 delete "$PM2_NAME" 2>/dev/null || true
 
+mkdir -p "$INSTALL_DIR/context/logs"
+
 pm2 start "$LAUNCH_SCRIPT" \
     --name "$PM2_NAME" \
     --cwd "$INSTALL_DIR" \
-    --log "$INSTALL_DIR/logs/arbos.log" \
+    --log "$INSTALL_DIR/context/logs/arbos.log" \
     --time \
     --restart-delay 10000
 
 pm2 save 2>/dev/null || true
 
+# ── Done ─────────────────────────────────────────────────────────────────
+printf "\n"
+printf "  ${GREEN}${BOLD}Arbos is live${NC}\n"
+printf "\n"
+
 sleep 2
 if pm2 pid "$PM2_NAME" >/dev/null 2>&1 && [ -n "$(pm2 pid "$PM2_NAME")" ]; then
     ok "Arbos running"
+    printf "\n  ${CYAN}Last 20 lines from logs:${NC}\n"
+    pm2 logs "$PM2_NAME" --lines 20 --nostream
 else
     err "Arbos may not have started — check logs:"
     printf "    ${DIM}pm2 logs $PM2_NAME${NC}\n"
 fi
 
-# ── Done ─────────────────────────────────────────────────────────────────
-printf "\n"
-printf "  ${GREEN}${BOLD}Arbos is live${NC}\n"
-printf "\n"
-printf "  ${DIM}logs${NC}     pm2 logs $PM2_NAME\n"
-printf "  ${DIM}status${NC}   pm2 status\n"
-printf "  ${DIM}restart${NC}  pm2 restart $PM2_NAME\n"
-printf "\n"
-printf "  ${BOLD}Next steps — open Telegram and message your bot:${NC}\n"
-printf "    Just tell it what you want in plain language, e.g.:\n"
-printf "    • \"I want you to build a SOTA quant trading system.\"\n"
-printf "    • \"What's the status of my trading system?\"\n"
-printf "    • \"Set the goal to ...\"\n"
-printf "    • \"Send a message to the trading system.\"\n"
-printf "    • \"...\"\n"
-printf "\n"

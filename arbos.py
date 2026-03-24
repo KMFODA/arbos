@@ -7,7 +7,7 @@ import subprocess
 import sys
 import time
 import threading
-import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field
@@ -17,20 +17,21 @@ import hashlib
 import re
 
 from dotenv import load_dotenv
-import httpx
 import requests
-import uvicorn
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
 
 WORKING_DIR = Path(__file__).parent
 PROMPT_FILE = WORKING_DIR / "PROMPT.md"
 CONTEXT_DIR = WORKING_DIR / "context"
-GOALS_DIR = CONTEXT_DIR / "goals"
-GOALS_JSON = CONTEXT_DIR / "goals.json"
+GOAL_FILE = CONTEXT_DIR / "GOAL.md"
+STATE_FILE = CONTEXT_DIR / "STATE.md"
+INBOX_FILE = CONTEXT_DIR / "INBOX.md"
+RUNS_DIR = CONTEXT_DIR / "runs"
+META_FILE = CONTEXT_DIR / "meta.json"
+STEP_MSG_FILE = CONTEXT_DIR / ".step_msg"
+CONTEXT_LOGS_DIR = CONTEXT_DIR / "logs"
 CHATLOG_DIR = CONTEXT_DIR / "chat"
 FILES_DIR = CONTEXT_DIR / "files"
 RESTART_FLAG = WORKING_DIR / ".restart"
@@ -218,32 +219,12 @@ def _redact_secrets(text: str) -> str:
         text = pattern.sub("[REDACTED]", text)
     return text
 MAX_CONCURRENT = int(os.environ.get("CLAUDE_MAX_CONCURRENT", "4"))
-PROVIDER = os.environ.get("PROVIDER", "chutes")
-PROXY_PORT = int(os.environ.get("PROXY_PORT", "8089"))
-PROXY_TIMEOUT = int(os.environ.get("PROXY_TIMEOUT", "600"))
-CHUTES_API_KEY = os.environ.get("CHUTES_API_KEY", "")
-
-if PROVIDER == "openrouter":
-    CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "anthropic/claude-opus-4.6")
-    LLM_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-    LLM_BASE_URL = "https://openrouter.ai/api"
-    COST_PER_M_INPUT = float(os.environ.get("COST_PER_M_INPUT", "5.00"))
-    COST_PER_M_OUTPUT = float(os.environ.get("COST_PER_M_OUTPUT", "25.00"))
-    CHUTES_ROUTING_AGENT = CLAUDE_MODEL
-    CHUTES_ROUTING_BOT = CLAUDE_MODEL
-else:
-    CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "moonshotai/Kimi-K2.5-TEE")
-    CHUTES_BASE_URL = os.environ.get("CHUTES_BASE_URL", "https://llm.chutes.ai/v1")
-    LLM_API_KEY = CHUTES_API_KEY
-    LLM_BASE_URL = CHUTES_BASE_URL
-    CHUTES_POOL = os.environ.get(
-        "CHUTES_POOL",
-        "moonshotai/Kimi-K2.5-TEE,zai-org/GLM-5-TEE,MiniMaxAI/MiniMax-M2.5-TEE,zai-org/GLM-4.7-TEE",
-    )
-    CHUTES_ROUTING_AGENT = os.environ.get("CHUTES_ROUTING_AGENT", f"{CHUTES_POOL}:throughput")
-    CHUTES_ROUTING_BOT = os.environ.get("CHUTES_ROUTING_BOT", f"{CHUTES_POOL}:latency")
-    COST_PER_M_INPUT = float(os.environ.get("COST_PER_M_INPUT", "0.14"))
-    COST_PER_M_OUTPUT = float(os.environ.get("COST_PER_M_OUTPUT", "0.60"))
+HEALTH_PORT = int(os.environ.get("ARBOS_HEALTH_PORT") or os.environ.get("PROXY_PORT", "8089"))
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "anthropic/claude-opus-4.6")
+LLM_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+LLM_BASE_URL = "https://openrouter.ai/api"
+COST_PER_M_INPUT = float(os.environ.get("COST_PER_M_INPUT", "5.00"))
+COST_PER_M_OUTPUT = float(os.environ.get("COST_PER_M_OUTPUT", "25.00"))
 IS_ROOT = os.getuid() == 0
 MAX_RETRIES = int(os.environ.get("CLAUDE_MAX_RETRIES", "5"))
 try:
@@ -258,6 +239,104 @@ _tls = threading.local()
 _log_lock = threading.Lock()
 _chatlog_lock = threading.Lock()
 _pending_env_lock = threading.Lock()
+
+_ENV_KEY_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_MAX_TELEGRAM_ENV_KEY_LEN = 128
+_MAX_TELEGRAM_ENV_VALUE_LEN = 8192
+_MAX_TELEGRAM_ENV_DESC_LEN = 500
+
+
+def _sanitize_telegram_env_description(text: str) -> str:
+    """Single-line comment text; no newlines or control characters."""
+    t = " ".join((text or "").split())
+    t = "".join(ch for ch in t if ch >= " " or ch in "\t")
+    t = t.replace("\t", " ")
+    return t.strip()[:_MAX_TELEGRAM_ENV_DESC_LEN].strip()
+
+
+def _dotenv_double_quote_value(val: str) -> str:
+    if len(val) > _MAX_TELEGRAM_ENV_VALUE_LEN:
+        raise ValueError(f"value exceeds {_MAX_TELEGRAM_ENV_VALUE_LEN} characters")
+    if "\n" in val or "\r" in val:
+        raise ValueError("value must not contain line breaks")
+    return val.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _apply_env_key_comment_block(
+    lines: list[str], key: str, value_line: str, comment_text: str
+) -> list[str]:
+    """Insert or update ``# comment`` + ``KEY=...`` block in .env-style lines."""
+    assign_prefix = f"{key}="
+    idx = None
+    for i, line in enumerate(lines):
+        stripped = line.split("#", 1)[0].strip()
+        if stripped.startswith(assign_prefix):
+            idx = i
+            break
+    comment_line = f"# {comment_text}".rstrip()
+    if idx is None:
+        out = list(lines)
+        if out and out[-1].strip():
+            out.append("")
+        out.append(comment_line)
+        out.append(value_line)
+        return out
+    out = list(lines)
+    if idx > 0 and out[idx - 1].strip().startswith("#"):
+        out[idx - 1] = comment_line
+        out[idx] = value_line
+    else:
+        out.insert(idx, comment_line)
+        out[idx + 1] = value_line
+    return out
+
+
+def _persist_env_var_with_comment(key: str, value: str, description: str) -> tuple[bool, str]:
+    """Append or update a variable in ``.env`` / ``.env.enc`` with a preceding comment line."""
+    key = key.strip()
+    if not key or len(key) > _MAX_TELEGRAM_ENV_KEY_LEN or not _ENV_KEY_NAME_RE.match(key):
+        return False, "Invalid KEY: use letters, digits, underscore; must start with letter or _."
+    desc = _sanitize_telegram_env_description(description)
+    if not desc:
+        return False, "DESCRIPTION required (non-empty after trimming)."
+    try:
+        escaped = _dotenv_double_quote_value(value)
+    except ValueError as e:
+        return False, str(e)
+    value_line = f'{key}="{escaped}"'
+    env_path = WORKING_DIR / ".env"
+
+    with _pending_env_lock:
+        if env_path.exists():
+            content = env_path.read_text()
+            new_lines = _apply_env_key_comment_block(
+                content.splitlines(), key, value_line, desc
+            )
+            env_path.write_text("\n".join(new_lines) + "\n")
+        elif ENV_ENC_FILE.exists():
+            bot_token = os.environ.get("TAU_BOT_TOKEN", "")
+            if not bot_token:
+                return False, "Cannot update encrypted .env: TAU_BOT_TOKEN not set in this process."
+            try:
+                content = _decrypt_env_content(bot_token)
+            except InvalidToken:
+                return False, "Could not decrypt .env.enc (wrong token?)."
+            new_lines = _apply_env_key_comment_block(
+                content.splitlines(), key, value_line, desc
+            )
+            payload = "\n".join(new_lines) + "\n"
+            fernet = Fernet(_derive_fernet_key(bot_token))
+            ENV_ENC_FILE.write_bytes(fernet.encrypt(payload.encode()))
+            os.chmod(str(ENV_ENC_FILE), 0o600)
+        else:
+            return False, "No .env or .env.enc in project directory."
+
+        os.environ[key] = value
+        _reload_env_secrets()
+
+    return True, f"Saved `{key}` with comment (value not shown). Active in this process."
+
+
 _shutdown = threading.Event()
 _claude_semaphore = threading.Semaphore(MAX_CONCURRENT)
 _step_count = 0
@@ -267,95 +346,139 @@ _child_procs: set[subprocess.Popen] = set()
 _child_procs_lock = threading.Lock()
 
 
-# ── Multi-goal state ────────────────────────────────────────────────────────
+# ── Single-agent state ───────────────────────────────────────────────────────
 
 
 @dataclass
-class GoalState:
-    index: int
+class AgentState:
     summary: str = ""
-    delay: int = 0
+    delay_minutes: int = 0
     started: bool = False
     paused: bool = False
     step_count: int = 0
     goal_hash: str = ""
     last_run: str = ""
     last_finished: str = ""
+    last_step_ok: bool | None = None
+    last_step_error: str = ""
     thread: threading.Thread | None = field(default=None, repr=False)
     wake: threading.Event = field(default_factory=threading.Event, repr=False)
     stop_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
 
-_goals: dict[int, GoalState] = {}
-_goals_lock = threading.Lock()
+_agent = AgentState()
+_agent_lock = threading.Lock()
+
+# Process-wide operator visibility (HTTP /health, Telegram /status).
+_arbos_boot_wall: float = 0.0
+_operator_lock = threading.Lock()
+_operator: dict[str, Any] = {
+    "phase": "boot",
+    "detail": "",
+    "last_tick_wall": 0.0,
+    "last_error": "",
+}
 
 
-def _goal_dir(index: int) -> Path:
-    return GOALS_DIR / str(index)
+def _operator_set(
+    phase: str,
+    detail: str = "",
+    *,
+    last_error: str | None = None,
+) -> None:
+    with _operator_lock:
+        _operator["phase"] = phase
+        _operator["detail"] = detail
+        _operator["last_tick_wall"] = time.time()
+        if last_error is not None:
+            _operator["last_error"] = last_error[:800]
 
 
-def _goal_file(index: int) -> Path:
-    return _goal_dir(index) / "GOAL.md"
+def _operator_tick() -> None:
+    with _operator_lock:
+        _operator["last_tick_wall"] = time.time()
 
 
-def _state_file(index: int) -> Path:
-    return _goal_dir(index) / "STATE.md"
-
-
-def _inbox_file(index: int) -> Path:
-    return _goal_dir(index) / "INBOX.md"
-
-
-def _goal_runs_dir(index: int) -> Path:
-    return _goal_dir(index) / "runs"
-
-
-def _step_msg_file(index: int) -> Path:
-    return _goal_dir(index) / ".step_msg"
-
-
-def _save_goals():
-    """Persist goal metadata to goals.json. Caller must hold _goals_lock."""
-    data = {}
-    for idx, gs in _goals.items():
-        data[str(idx)] = {
-            "summary": gs.summary,
-            "delay": gs.delay,
-            "started": gs.started,
-            "paused": gs.paused,
-            "step_count": gs.step_count,
-            "goal_hash": gs.goal_hash,
-            "last_run": gs.last_run,
-            "last_finished": gs.last_finished,
+def _operator_health_payload() -> dict[str, Any]:
+    """JSON-serializable snapshot for GET /health (and operators)."""
+    now = time.time()
+    with _operator_lock:
+        tick = float(_operator["last_tick_wall"])
+        op = {
+            "phase": _operator["phase"],
+            "detail": _operator["detail"],
+            "seconds_since_activity": max(0, int(now - tick)),
+            "last_error": _operator["last_error"] or None,
         }
-    GOALS_JSON.parent.mkdir(parents=True, exist_ok=True)
-    GOALS_JSON.write_text(json.dumps(data, indent=2))
+    boot = _arbos_boot_wall or now
+    out: dict[str, Any] = {
+        "status": "ok",
+        "uptime_seconds": int(now - boot),
+        "operator": op,
+        "agent": {},
+    }
+    with _agent_lock:
+        gs = _agent
+        out["agent"] = {
+            "state": _agent_status_label(gs),
+            "delay_minutes": gs.delay_minutes,
+            "step_count": gs.step_count,
+            "last_step_ok": gs.last_step_ok,
+            "last_run": gs.last_run or None,
+            "last_finished": gs.last_finished or None,
+            "last_step_error": (gs.last_step_error[:240] + "…")
+            if len(gs.last_step_error) > 240
+            else (gs.last_step_error or None),
+            "summary": gs.summary or None,
+        }
+    if not LLM_API_KEY:
+        out["status"] = "degraded"
+        out["degraded_reason"] = "OPENROUTER_API_KEY not set — LLM calls will fail"
+    return out
 
 
-def _load_goals():
-    """Load goal metadata from goals.json into _goals dict."""
-    global _goals
-    if not GOALS_JSON.exists():
+def _save_agent():
+    """Persist agent metadata to meta.json."""
+    with _agent_lock:
+        data = {
+            "summary": _agent.summary,
+            "delay_minutes": _agent.delay_minutes,
+            "started": _agent.started,
+            "paused": _agent.paused,
+            "step_count": _agent.step_count,
+            "goal_hash": _agent.goal_hash,
+            "last_run": _agent.last_run,
+            "last_finished": _agent.last_finished,
+            "last_step_ok": _agent.last_step_ok,
+            "last_step_error": _agent.last_step_error,
+        }
+    META_FILE.parent.mkdir(parents=True, exist_ok=True)
+    META_FILE.write_text(json.dumps(data, indent=2))
+
+
+def _load_agent():
+    """Load agent metadata from meta.json into _agent."""
+    if not META_FILE.exists():
         return
     try:
-        data = json.loads(GOALS_JSON.read_text())
+        info = json.loads(META_FILE.read_text())
     except (json.JSONDecodeError, OSError):
         return
-    for idx_str, info in data.items():
-        idx = int(idx_str)
-        if not _goal_file(idx).exists():
-            continue
-        _goals[idx] = GoalState(
-            index=idx,
-            summary=info.get("summary", ""),
-            delay=info.get("delay", 0),
-            started=info.get("started", False),
-            paused=info.get("paused", False),
-            step_count=info.get("step_count", 0),
-            goal_hash=info.get("goal_hash", ""),
-            last_run=info.get("last_run", ""),
-            last_finished=info.get("last_finished", ""),
-        )
+    with _agent_lock:
+        _agent.summary = info.get("summary", "")
+        if "delay_minutes" in info:
+            _agent.delay_minutes = int(info["delay_minutes"])
+        else:
+            legacy_s = int(info.get("delay", 0))
+            _agent.delay_minutes = (legacy_s + 59) // 60 if legacy_s > 0 else 0
+        _agent.started = info.get("started", False)
+        _agent.paused = info.get("paused", False)
+        _agent.step_count = info.get("step_count", 0)
+        _agent.goal_hash = info.get("goal_hash", "")
+        _agent.last_run = info.get("last_run", "")
+        _agent.last_finished = info.get("last_finished", "")
+        _agent.last_step_ok = info.get("last_step_ok")
+        _agent.last_step_error = info.get("last_step_error", "")
 
 
 def _format_last_time(iso_ts: str) -> str:
@@ -375,7 +498,7 @@ def _format_last_time(iso_ts: str) -> str:
         return "unknown"
 
 
-def _goal_status_label(gs: GoalState) -> str:
+def _agent_status_label(gs: AgentState) -> str:
     if gs.started and not gs.paused:
         return "running"
     if gs.started and gs.paused:
@@ -429,44 +552,51 @@ def fmt_tokens(inp: int, out: int, elapsed: float = 0) -> str:
     return f"{_k(inp)} in / {_k(out)} out{tps}{cost_str}"
 
 
+def _arbos_response_header(elapsed_s: float) -> str:
+    """First line on Telegram for agent/operator responses: elapsed + token usage."""
+    inp, out = _get_tokens()
+    toks = fmt_tokens(inp, out, elapsed_s) if (inp or out) else "0 toks"
+    return f"Arbos ( {fmt_duration(elapsed_s)}, {toks} )"
+
+
 # ── Prompt helpers ───────────────────────────────────────────────────────────
 
-def load_prompt(goal_index: int, consume_inbox: bool = False, goal_step: int = 0) -> str:
-    """Build full prompt: PROMPT.md + goal's GOAL/STATE/INBOX + chatlog."""
+def load_prompt(consume_inbox: bool = False, agent_step: int = 0) -> str:
+    """Build full prompt: PROMPT.md + GOAL/STATE/INBOX + chatlog."""
     parts = []
     if PROMPT_FILE.exists():
         text = PROMPT_FILE.read_text().strip()
         if text:
             parts.append(text)
-    gf = _goal_file(goal_index)
-    if gf.exists():
-        goal_text = gf.read_text().strip()
+    if GOAL_FILE.exists():
+        goal_text = GOAL_FILE.read_text().strip()
         if goal_text:
-            header = f"## Goal #{goal_index} (step {goal_step})" if goal_step else f"## Goal #{goal_index}"
-            parts.append(f"{header}\n\n{goal_text}\n\nYour context files are in context/goals/{goal_index}/ (STATE.md, INBOX.md, runs/).")
-    sf = _state_file(goal_index)
-    if sf.exists():
-        state_text = sf.read_text().strip()
+            header = f"## Goal (step {agent_step})" if agent_step else "## Goal"
+            parts.append(
+                f"{header}\n\n{goal_text}\n\n"
+                "Your context files are under context/: STATE.md, INBOX.md, runs/, "
+                "chat/, files/, tools/, workspace/ (see PROMPT.md)."
+            )
+    if STATE_FILE.exists():
+        state_text = STATE_FILE.read_text().strip()
         if state_text:
             parts.append(f"## State\n\n{state_text}")
-    inf = _inbox_file(goal_index)
-    if inf.exists():
-        inbox_text = inf.read_text().strip()
+    if INBOX_FILE.exists():
+        inbox_text = INBOX_FILE.read_text().strip()
         if inbox_text:
             parts.append(f"## Inbox\n\n{inbox_text}")
         if consume_inbox:
-            inf.write_text("")
+            INBOX_FILE.write_text("")
     chatlog = load_chatlog()
     if chatlog:
         parts.append(chatlog)
     return "\n\n".join(parts)
 
 
-def make_run_dir(goal_index: int = 0) -> Path:
-    runs_dir = _goal_runs_dir(goal_index) if goal_index else GOALS_DIR / "_runs"
-    runs_dir.mkdir(parents=True, exist_ok=True)
+def make_run_dir() -> Path:
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = runs_dir / ts
+    run_dir = RUNS_DIR / ts
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
 
@@ -530,6 +660,42 @@ def load_chatlog(max_chars: int = 8000) -> str:
 
 TELEGRAM_TEXT_MAX = 4096
 TELEGRAM_SAFE_TEXT = 3900
+
+TELEGRAM_HELP_TEXT = f"""\
+Arbos — Telegram commands
+
+Goal loop
+/goal <description> — set the goal and start the loop automatically
+/pause — pause stepping
+/resume — resume stepping
+/clear — clear goal files and reset agent state
+/delay <mins> — minutes to wait between successful steps
+
+Other
+/start — register as owner (first time) or show this help
+/status — snapshot (JSON: GET http://127.0.0.1:{HEALTH_PORT}/health)
+/restart — exit for pm2 to restart the agent
+/update — git pull --ff-only, then restart
+/env KEY VALUE DESCRIPTION — set or update one env var (VALUE = single token, no spaces)
+
+Operator
+Send text, a photo, or a document to talk to the Claude operator (voice notes are not transcribed).
+
+First use: /start registers you as owner if none is set yet.
+"""
+
+
+def _is_leading_slash_command(message) -> bool:
+    """True if the message is a Telegram-style /command (entity or leading /)."""
+    text = (message.text or "").strip()
+    if not text.startswith("/"):
+        return False
+    entities = getattr(message, "entities", None) or []
+    for ent in entities:
+        if getattr(ent, "type", None) == "bot_command" and getattr(ent, "offset", None) == 0:
+            return True
+    # Some clients omit entities; leading / still means slash-command UX.
+    return True
 
 
 def _truncate_telegram_text(text: str, limit: int = TELEGRAM_SAFE_TEXT) -> str:
@@ -744,520 +910,30 @@ def _download_telegram_file(bot, file_id: str, filename: str) -> Path:
     return save_path
 
 
-# ── Chutes proxy (Anthropic Messages API → OpenAI Chat Completions) ──────────
-
-_proxy_app = FastAPI(title="Chutes Proxy")
-
-
-def _convert_tools_to_openai(anthropic_tools: list[dict]) -> list[dict]:
-    out = []
-    for t in anthropic_tools:
-        out.append({
-            "type": "function",
-            "function": {
-                "name": t["name"],
-                "description": t.get("description", ""),
-                "parameters": t.get("input_schema", {"type": "object", "properties": {}}),
-            },
-        })
-    return out
-
-
-def _convert_messages_to_openai(
-    messages: list[dict], system: str | list | None = None
-) -> list[dict]:
-    out: list[dict] = []
-
-    if system:
-        if isinstance(system, list):
-            text_parts = [b["text"] for b in system if b.get("type") == "text"]
-            system = "\n\n".join(text_parts)
-        if system:
-            out.append({"role": "system", "content": system})
-
-    for msg in messages:
-        role = msg["role"]
-        content = msg.get("content", "")
-
-        if isinstance(content, str):
-            out.append({"role": role, "content": content})
-            continue
-
-        if not isinstance(content, list):
-            out.append({"role": role, "content": str(content)})
-            continue
-
-        text_parts: list[str] = []
-        tool_calls: list[dict] = []
-        tool_results: list[dict] = []
-        image_parts: list[dict] = []
-
-        for block in content:
-            btype = block.get("type", "")
-
-            if btype == "text":
-                text_parts.append(block["text"])
-
-            elif btype == "tool_use":
-                tool_calls.append({
-                    "id": block["id"],
-                    "type": "function",
-                    "function": {
-                        "name": block["name"],
-                        "arguments": json.dumps(block.get("input", {})),
-                    },
-                })
-
-            elif btype == "tool_result":
-                result_content = block.get("content", "")
-                if isinstance(result_content, list):
-                    result_content = "\n".join(
-                        b.get("text", "") for b in result_content if b.get("type") == "text"
-                    )
-                tool_results.append({
-                    "role": "tool",
-                    "tool_call_id": block["tool_use_id"],
-                    "content": str(result_content),
-                })
-
-            elif btype == "image":
-                source = block.get("source", {})
-                if source.get("type") == "base64":
-                    image_parts.append({
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{source.get('media_type', 'image/png')};base64,{source['data']}"
-                        },
-                    })
-
-        if role == "assistant":
-            oai_msg: dict[str, Any] = {"role": "assistant"}
-            if text_parts:
-                oai_msg["content"] = "\n".join(text_parts)
-            else:
-                oai_msg["content"] = None
-            if tool_calls:
-                oai_msg["tool_calls"] = tool_calls
-            out.append(oai_msg)
-
-        elif role == "user":
-            if tool_results:
-                for tr in tool_results:
-                    out.append(tr)
-            if text_parts or image_parts:
-                if image_parts:
-                    content_blocks = [{"type": "text", "text": t} for t in text_parts] + image_parts
-                    out.append({"role": "user", "content": content_blocks})
-                elif text_parts:
-                    out.append({"role": "user", "content": "\n".join(text_parts)})
-        else:
-            out.append({"role": role, "content": "\n".join(text_parts) if text_parts else ""})
-
-    return out
-
-
-def _build_openai_request(body: dict, *, routing: str = "agent") -> dict:
-    routing_model = CHUTES_ROUTING_BOT if routing == "bot" else CHUTES_ROUTING_AGENT
-    oai: dict[str, Any] = {
-        "model": routing_model,
-        "messages": _convert_messages_to_openai(
-            body.get("messages", []),
-            system=body.get("system"),
-        ),
-    }
-    if "max_tokens" in body:
-        oai["max_tokens"] = body["max_tokens"]
-    if body.get("tools"):
-        oai["tools"] = _convert_tools_to_openai(body["tools"])
-        oai["tool_choice"] = "auto"
-    if body.get("temperature") is not None:
-        oai["temperature"] = body["temperature"]
-    if body.get("top_p") is not None:
-        oai["top_p"] = body["top_p"]
-    if body.get("stream"):
-        oai["stream"] = True
-        oai["stream_options"] = {"include_usage": True}
-    return oai
-
-
-def _openai_response_to_anthropic(oai_resp: dict, model: str) -> dict:
-    choice = oai_resp.get("choices", [{}])[0]
-    message = choice.get("message", {})
-    finish = choice.get("finish_reason", "stop")
-
-    content_blocks: list[dict] = []
-    if message.get("content"):
-        content_blocks.append({"type": "text", "text": message["content"]})
-    for tc in (message.get("tool_calls") or []):
-        try:
-            args = json.loads(tc["function"]["arguments"])
-        except (json.JSONDecodeError, KeyError):
-            args = {}
-        content_blocks.append({
-            "type": "tool_use",
-            "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:12]}"),
-            "name": tc["function"]["name"],
-            "input": args,
-        })
-
-    if finish == "tool_calls":
-        stop_reason = "tool_use"
-    elif finish == "length":
-        stop_reason = "max_tokens"
-    else:
-        stop_reason = "end_turn"
-
-    usage = oai_resp.get("usage", {})
-    return {
-        "id": oai_resp.get("id", f"msg_{uuid.uuid4().hex}"),
-        "type": "message",
-        "role": "assistant",
-        "model": model,
-        "content": content_blocks or [{"type": "text", "text": ""}],
-        "stop_reason": stop_reason,
-        "stop_sequence": None,
-        "usage": {
-            "input_tokens": usage.get("prompt_tokens", 0),
-            "output_tokens": usage.get("completion_tokens", 0),
-        },
-    }
-
-
-def _sse_event(event: str, data: dict) -> str:
-    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
-
-
-async def _stream_openai_to_anthropic(oai_response: httpx.Response, model: str):
-    msg_id = f"msg_{uuid.uuid4().hex}"
-    yield _sse_event("message_start", {
-        "type": "message_start",
-        "message": {
-            "id": msg_id, "type": "message", "role": "assistant",
-            "model": model, "content": [], "stop_reason": None,
-            "stop_sequence": None,
-            "usage": {"input_tokens": 0, "output_tokens": 0},
-        },
-    })
-
-    block_idx = 0
-    in_text_block = False
-    tool_calls_accum: dict[int, dict] = {}
-    stop_reason = "end_turn"
-    usage = {"input_tokens": 0, "output_tokens": 0}
-    logged_stream_model = False
-
-    async for line in oai_response.aiter_lines():
-        if not line.startswith("data: "):
-            continue
-        data_str = line[6:].strip()
-        if data_str == "[DONE]":
-            break
-        try:
-            chunk = json.loads(data_str)
-        except json.JSONDecodeError:
-            continue
-
-        if not logged_stream_model and chunk.get("model"):
-            _log(f"proxy: stream model={chunk['model']}")
-            logged_stream_model = True
-
-        if chunk.get("usage"):
-            u = chunk["usage"]
-            usage["input_tokens"] = u.get("prompt_tokens", usage["input_tokens"])
-            usage["output_tokens"] = u.get("completion_tokens", usage["output_tokens"])
-
-        choices = chunk.get("choices", [])
-        if not choices:
-            continue
-
-        delta = choices[0].get("delta", {})
-        finish = choices[0].get("finish_reason")
-
-        if finish == "tool_calls":
-            stop_reason = "tool_use"
-        elif finish == "length":
-            stop_reason = "max_tokens"
-        elif finish == "stop":
-            stop_reason = "end_turn"
-
-        if delta.get("content"):
-            if not in_text_block:
-                yield _sse_event("content_block_start", {
-                    "type": "content_block_start",
-                    "index": block_idx,
-                    "content_block": {"type": "text", "text": ""},
-                })
-                in_text_block = True
-            yield _sse_event("content_block_delta", {
-                "type": "content_block_delta",
-                "index": block_idx,
-                "delta": {"type": "text_delta", "text": delta["content"]},
-            })
-
-        if delta.get("tool_calls"):
-            if in_text_block:
-                yield _sse_event("content_block_stop", {
-                    "type": "content_block_stop", "index": block_idx,
-                })
-                block_idx += 1
-                in_text_block = False
-            for tc in delta["tool_calls"]:
-                tc_idx = tc.get("index", 0)
-                if tc_idx not in tool_calls_accum:
-                    tool_calls_accum[tc_idx] = {
-                        "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:12]}"),
-                        "name": tc.get("function", {}).get("name", ""),
-                        "arguments": "",
-                        "block_idx": block_idx,
-                    }
-                    yield _sse_event("content_block_start", {
-                        "type": "content_block_start",
-                        "index": block_idx,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": tool_calls_accum[tc_idx]["id"],
-                            "name": tool_calls_accum[tc_idx]["name"],
-                            "input": {},
-                        },
-                    })
-                    block_idx += 1
-                args_chunk = tc.get("function", {}).get("arguments", "")
-                if args_chunk:
-                    tool_calls_accum[tc_idx]["arguments"] += args_chunk
-                    yield _sse_event("content_block_delta", {
-                        "type": "content_block_delta",
-                        "index": tool_calls_accum[tc_idx]["block_idx"],
-                        "delta": {"type": "input_json_delta", "partial_json": args_chunk},
-                    })
-
-    with _token_lock:
-        _token_usage["input"] += usage["input_tokens"]
-        _token_usage["output"] += usage["output_tokens"]
-
-    if in_text_block:
-        yield _sse_event("content_block_stop", {
-            "type": "content_block_stop", "index": block_idx,
-        })
-    for tc in tool_calls_accum.values():
-        yield _sse_event("content_block_stop", {
-            "type": "content_block_stop", "index": tc["block_idx"],
-        })
-
-    yield _sse_event("message_delta", {
-        "type": "message_delta",
-        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-        "usage": {"output_tokens": usage["output_tokens"]},
-    })
-    yield _sse_event("message_stop", {"type": "message_stop"})
-
-
-def _chutes_headers() -> dict:
-    return {
-        "Authorization": f"Bearer {LLM_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-
-@_proxy_app.get("/health")
-async def _proxy_health():
-    return {"status": "ok"}
-
-
-@_proxy_app.get("/")
-async def _proxy_root():
-    return {
-        "proxy": "chutes",
-        "pool": CHUTES_POOL,
-        "agent_routing": CHUTES_ROUTING_AGENT,
-        "bot_routing": CHUTES_ROUTING_BOT,
-        "status": "running",
-    }
-
-
-_CONTEXT_LENGTH_RE = re.compile(
-    r"maximum context length is (\d+) tokens.*?(\d+) output tokens.*?(\d+) input tokens",
-    re.DOTALL,
-)
-PROXY_MAX_RETRIES = 3
-
-
-def _parse_context_length_error(error_msg: str) -> tuple[int, int, int] | None:
-    """Extract (context_limit, requested_output, input_tokens) from a context-length 400."""
-    m = _CONTEXT_LENGTH_RE.search(error_msg)
-    if m:
-        return int(m.group(1)), int(m.group(2)), int(m.group(3))
-    return None
-
-
-def _maybe_reduce_max_tokens(oai_request: dict, error_msg: str) -> bool:
-    """If the error is a context-length overflow, reduce max_tokens to fit. Returns True if adjusted."""
-    parsed = _parse_context_length_error(error_msg)
-    if not parsed:
-        return False
-    ctx_limit, _req_output, input_tokens = parsed
-    headroom = ctx_limit - input_tokens
-    if headroom < 1024:
-        return False
-    new_max = max(1024, headroom - 64)
-    old_max = oai_request.get("max_tokens", 0)
-    if new_max >= old_max:
-        return False
-    oai_request["max_tokens"] = new_max
-    _log(f"proxy: reduced max_tokens {old_max} -> {new_max} (ctx_limit={ctx_limit}, input={input_tokens})")
-    return True
-
-
-@_proxy_app.post("/v1/messages")
-async def _proxy_messages(request: Request):
-    body = await request.json()
-    stream = body.get("stream", False)
-    model = body.get("model", CLAUDE_MODEL)
-    routing = "bot" if model == "bot" else "agent"
-    oai_request = _build_openai_request(body, routing=routing)
-    routing_label = CHUTES_ROUTING_BOT if routing == "bot" else CHUTES_ROUTING_AGENT
-
-    if stream:
-        last_error_msg = ""
-        for attempt in range(1, PROXY_MAX_RETRIES + 1):
-            try:
-                client = httpx.AsyncClient(timeout=httpx.Timeout(PROXY_TIMEOUT))
-                resp = await client.send(
-                    client.build_request(
-                        "POST", f"{CHUTES_BASE_URL}/chat/completions",
-                        json=oai_request, headers=_chutes_headers(),
-                    ),
-                    stream=True,
-                )
-                if resp.status_code != 200:
-                    error_body = await resp.aread()
-                    await resp.aclose()
-                    await client.aclose()
-                    last_error_msg = error_body.decode()[:500]
-                    _log(f"proxy: chutes returned {resp.status_code} (attempt {attempt}/{PROXY_MAX_RETRIES}): {last_error_msg[:300]}")
-
-                    if resp.status_code == 400 and _maybe_reduce_max_tokens(oai_request, last_error_msg):
-                        continue
-                    if attempt < PROXY_MAX_RETRIES:
-                        continue
-
-                    return JSONResponse(status_code=502, content={
-                        "type": "error", "error": {
-                            "type": "api_error",
-                            "message": f"Chutes routing failed ({resp.status_code}): {last_error_msg[:300]}",
-                        },
-                    })
-
-                async def generate(resp=resp, cl=client):
-                    try:
-                        _log(f"proxy: streaming [{routing}] via {routing_label}")
-                        async for event in _stream_openai_to_anthropic(resp, model):
-                            yield event
-                    finally:
-                        await resp.aclose()
-                        await cl.aclose()
-
-                return StreamingResponse(
-                    generate(), media_type="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-                )
-            except httpx.TimeoutException:
-                last_error_msg = f"timed out after {PROXY_TIMEOUT}s"
-                _log(f"proxy: {last_error_msg} (attempt {attempt}/{PROXY_MAX_RETRIES})")
-                if attempt < PROXY_MAX_RETRIES:
-                    continue
-                return JSONResponse(status_code=502, content={
-                    "type": "error", "error": {
-                        "type": "api_error",
-                        "message": f"Chutes routing {last_error_msg}",
-                    },
-                })
-            except Exception as exc:
-                last_error_msg = str(exc)[:300]
-                _log(f"proxy: error (attempt {attempt}/{PROXY_MAX_RETRIES}): {last_error_msg}")
-                if attempt < PROXY_MAX_RETRIES:
-                    continue
-                return JSONResponse(status_code=502, content={
-                    "type": "error", "error": {
-                        "type": "api_error",
-                        "message": f"Chutes routing error: {last_error_msg}",
-                    },
-                })
-
-    else:
-        oai_request.pop("stream", None)
-        oai_request.pop("stream_options", None)
-        last_error_msg = ""
-        for attempt in range(1, PROXY_MAX_RETRIES + 1):
-            try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(PROXY_TIMEOUT)) as client:
-                    resp = await client.post(
-                        f"{CHUTES_BASE_URL}/chat/completions",
-                        json=oai_request, headers=_chutes_headers(),
-                    )
-                if resp.status_code != 200:
-                    last_error_msg = resp.text[:500]
-                    _log(f"proxy: chutes returned {resp.status_code} (attempt {attempt}/{PROXY_MAX_RETRIES}): {last_error_msg[:300]}")
-
-                    if resp.status_code == 400 and _maybe_reduce_max_tokens(oai_request, last_error_msg):
-                        continue
-                    if attempt < PROXY_MAX_RETRIES:
-                        continue
-
-                    return JSONResponse(status_code=502, content={
-                        "type": "error", "error": {
-                            "type": "api_error",
-                            "message": f"Chutes routing failed ({resp.status_code}): {last_error_msg[:300]}",
-                        },
-                    })
-                oai_data = resp.json()
-                actual_model = oai_data.get("model", "?")
-                u = oai_data.get("usage", {})
-                if u:
-                    with _token_lock:
-                        _token_usage["input"] += u.get("prompt_tokens", 0)
-                        _token_usage["output"] += u.get("completion_tokens", 0)
-                _log(f"proxy: response [{routing}] via {routing_label} model={actual_model}")
-                return JSONResponse(content=_openai_response_to_anthropic(oai_data, model))
-            except httpx.TimeoutException:
-                last_error_msg = f"timed out after {PROXY_TIMEOUT}s"
-                _log(f"proxy: {last_error_msg} (attempt {attempt}/{PROXY_MAX_RETRIES})")
-                if attempt < PROXY_MAX_RETRIES:
-                    continue
-                return JSONResponse(status_code=502, content={
-                    "type": "error", "error": {
-                        "type": "api_error",
-                        "message": f"Chutes routing {last_error_msg}",
-                    },
-                })
-            except Exception as exc:
-                last_error_msg = str(exc)[:300]
-                _log(f"proxy: error (attempt {attempt}/{PROXY_MAX_RETRIES}): {last_error_msg}")
-                if attempt < PROXY_MAX_RETRIES:
-                    continue
-                return JSONResponse(status_code=502, content={
-                    "type": "error", "error": {
-                        "type": "api_error",
-                        "message": f"Chutes routing error: {last_error_msg}",
-                    },
-                })
-
-
-@_proxy_app.post("/v1/messages/count_tokens")
-async def _proxy_count_tokens(request: Request):
-    body = await request.json()
-    rough = sum(len(json.dumps(m)) for m in body.get("messages", [])) // 4
-    rough += len(json.dumps(body.get("tools", []))) // 4
-    rough += len(str(body.get("system", ""))) // 4
-    return JSONResponse(content={"input_tokens": max(rough, 1)})
-
-
-def _start_proxy():
-    """Run the Chutes translation proxy in-process on a background thread."""
-    config = uvicorn.Config(
-        _proxy_app, host="127.0.0.1", port=PROXY_PORT, log_level="warning",
-    )
-    server = uvicorn.Server(config)
-    server.run()
+# ── Local health HTTP (GET /health only) ─────────────────────────────────────
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt: str, *args: Any) -> None:
+        return
+
+    def do_GET(self) -> None:
+        path = self.path.split("?", 1)[0]
+        if path != "/health":
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = json.dumps(_operator_health_payload()).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def _start_health_server() -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", HEALTH_PORT), _HealthHandler)
+    server.serve_forever()
 
 
 # ── Agent runner ─────────────────────────────────────────────────────────────
@@ -1273,27 +949,16 @@ def _claude_cmd(prompt: str, extra_flags: list[str] | None = None) -> list[str]:
 
 
 def _write_claude_settings():
-    """Point Claude Code at the active provider (OpenRouter direct or Chutes proxy)."""
+    """Point Claude Code at OpenRouter (Anthropic-compatible API)."""
     settings_dir = WORKING_DIR / ".claude"
     settings_dir.mkdir(exist_ok=True)
 
-    if PROVIDER == "openrouter":
-        env_block = {
-            "ANTHROPIC_API_KEY": LLM_API_KEY,
-            "ANTHROPIC_BASE_URL": LLM_BASE_URL,
-            "ANTHROPIC_AUTH_TOKEN": "",
-            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-        }
-        target_label = LLM_BASE_URL
-    else:
-        proxy_url = f"http://127.0.0.1:{PROXY_PORT}"
-        env_block = {
-            "ANTHROPIC_API_KEY": "chutes-proxy",
-            "ANTHROPIC_BASE_URL": proxy_url,
-            "ANTHROPIC_AUTH_TOKEN": "",
-            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-        }
-        target_label = proxy_url
+    env_block = {
+        "ANTHROPIC_API_KEY": LLM_API_KEY,
+        "ANTHROPIC_BASE_URL": LLM_BASE_URL,
+        "ANTHROPIC_AUTH_TOKEN": "",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    }
 
     settings = {
         "model": CLAUDE_MODEL,
@@ -1307,23 +972,88 @@ def _write_claude_settings():
         "env": env_block,
     }
     (settings_dir / "settings.local.json").write_text(json.dumps(settings, indent=2))
-    _log(f"wrote .claude/settings.local.json (provider={PROVIDER}, model={CLAUDE_MODEL}, target={target_label})")
+    _log(f"wrote .claude/settings.local.json (openrouter, model={CLAUDE_MODEL}, target={LLM_BASE_URL})")
 
 
-def _claude_env(goal_index: int = 0) -> dict[str, str]:
+def _claude_env() -> dict[str, str]:
     env = os.environ.copy()
     env.pop("TAU_BOT_TOKEN", None)
-    if goal_index:
-        env["ARBOS_GOAL_INDEX"] = str(goal_index)
-    if PROVIDER == "openrouter":
-        env["ANTHROPIC_API_KEY"] = LLM_API_KEY
-        env["ANTHROPIC_BASE_URL"] = LLM_BASE_URL
-        env["ANTHROPIC_AUTH_TOKEN"] = ""
-    else:
-        env["ANTHROPIC_API_KEY"] = "chutes-proxy"
-        env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{PROXY_PORT}"
-        env["ANTHROPIC_AUTH_TOKEN"] = ""
+    env["ANTHROPIC_API_KEY"] = LLM_API_KEY
+    env["ANTHROPIC_BASE_URL"] = LLM_BASE_URL
+    env["ANTHROPIC_AUTH_TOKEN"] = ""
     return env
+
+
+def _anthropic_usage_in_out(usage: Any) -> tuple[int, int]:
+    """Parse Anthropic-style usage dict → (input_tokens, output_tokens)."""
+    if not isinstance(usage, dict):
+        return 0, 0
+
+    def _int_val(*keys: str) -> int:
+        for k in keys:
+            v = usage.get(k)
+            if v is None:
+                continue
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    return _int_val("input_tokens", "prompt_tokens"), _int_val(
+        "output_tokens", "completion_tokens"
+    )
+
+
+def _join_stream_text_chunks(parts: list[str]) -> str:
+    """Join Claude stream-json text deltas without gluing sentences together.
+
+    Sequential deltas often omit whitespace at boundaries (e.g. ``...tests.`` +
+    ``Building...``). Insert a newline when sentence-ending punctuation meets a
+    capital letter so context logs and Telegram stay readable; this avoids
+    splitting inside words (``Build`` + ``ing``).
+    """
+    out: list[str] = []
+    for t in parts:
+        if not t:
+            continue
+        if out:
+            prev = out[-1]
+            if (
+                prev
+                and t
+                and (not prev[-1].isspace())
+                and (not t[0].isspace())
+                and prev[-1] in ".!?"
+                and t[0].isupper()
+            ):
+                out.append("\n")
+        out.append(t)
+    return "".join(out)
+
+
+def _prefer_richer_assistant_text(
+    result_text: str,
+    complete_texts: list[str],
+    streaming_tokens: list[str],
+) -> str:
+    """Pick assistant text to show after the CLI exits.
+
+    The final stream-json ``result`` field is sometimes a short post-tool phrase
+    (for example after sending a message) while the substantive answer was
+    already streamed. Prefer the substantially longer assistant payload so the
+    operator keeps the full reply.
+    """
+    r = (result_text or "").strip()
+    joined_complete = "\n\n".join(complete_texts).strip()
+    streamed = _join_stream_text_chunks(streaming_tokens).strip()
+    candidates = [x for x in (joined_complete, streamed, r) if x]
+    if not candidates:
+        return result_text or ""
+    longest = max(candidates, key=len)
+    if len(longest) > len(r) + 80:
+        return longest
+    return r if r else longest
 
 
 def _run_claude_once(cmd, env, on_text=None, on_activity=None):
@@ -1377,17 +1107,16 @@ def _run_claude_once(cmd, env, on_text=None, on_activity=None):
                     else:
                         streaming_tokens.append(block["text"])
                         if on_text:
-                            on_text("".join(streaming_tokens))
+                            on_text(_join_stream_text_chunks(streaming_tokens))
                 elif btype == "tool_use" and on_activity:
                     tool_name = block.get("name", "")
                     tool_input = block.get("input", {})
                     on_activity(_format_tool_activity(tool_name, tool_input))
-            if PROVIDER == "openrouter":
-                u = msg.get("usage", {})
-                if u:
-                    with _token_lock:
-                        _token_usage["input"] += u.get("input_tokens", 0)
-                        _token_usage["output"] += u.get("output_tokens", 0)
+            ui, uo = _anthropic_usage_in_out(msg.get("usage"))
+            if ui or uo:
+                with _token_lock:
+                    _token_usage["input"] += ui
+                    _token_usage["output"] += uo
         elif etype == "item.completed":
             item = evt.get("item", {})
             if item.get("type") == "agent_message" and item.get("text"):
@@ -1397,12 +1126,11 @@ def _run_claude_once(cmd, env, on_text=None, on_activity=None):
                     on_text(item["text"])
         elif etype == "result":
             result_text = evt.get("result", "")
-            if PROVIDER == "openrouter":
-                u = evt.get("usage", {})
-                if u:
-                    with _token_lock:
-                        _token_usage["input"] += u.get("input_tokens", 0)
-                        _token_usage["output"] += u.get("output_tokens", 0)
+            ui, uo = _anthropic_usage_in_out(evt.get("usage"))
+            if ui or uo:
+                with _token_lock:
+                    _token_usage["input"] += ui
+                    _token_usage["output"] += uo
 
     try:
         while True:
@@ -1471,7 +1199,11 @@ def _run_claude_once(cmd, env, on_text=None, on_activity=None):
         if complete_texts:
             result_text = complete_texts[-1]
         elif streaming_tokens:
-            result_text = "".join(streaming_tokens)
+            result_text = _join_stream_text_chunks(streaming_tokens)
+
+    result_text = _prefer_richer_assistant_text(
+        result_text, complete_texts, streaming_tokens
+    )
 
     stderr_output = "".join(stderr_acc)
     if timed_out:
@@ -1486,10 +1218,10 @@ def _run_claude_once(cmd, env, on_text=None, on_activity=None):
 
 
 def run_agent(cmd: list[str], phase: str, output_file: Path,
-              on_text=None, on_activity=None, goal_index: int = 0) -> subprocess.CompletedProcess:
+              on_text=None, on_activity=None) -> subprocess.CompletedProcess:
     _claude_semaphore.acquire()
     try:
-        env = _claude_env(goal_index=goal_index)
+        env = _claude_env()
         flags = " ".join(a for a in cmd if a.startswith("-"))
 
         returncode, result_text, raw_lines, stderr_output = 1, "", [], "no attempts made"
@@ -1544,27 +1276,29 @@ def extract_text(result: subprocess.CompletedProcess) -> str:
     )
 
 
-def run_step(prompt: str, step_number: int, goal_index: int = 0, goal_step: int = 0) -> bool:
-    run_dir = make_run_dir(goal_index=goal_index)
+def run_step(prompt: str, step_number: int, agent_step: int = 0) -> tuple[bool, str]:
+    run_dir = make_run_dir()
     t0 = time.monotonic()
+    _reset_tokens()
 
     log_file = run_dir / "logs.txt"
     _tls.log_fh = open(log_file, "a", encoding="utf-8")
 
-    smf = _step_msg_file(goal_index) if goal_index else CONTEXT_DIR / ".step_msg"
+    smf = STEP_MSG_FILE
 
     target = _step_update_target()
-    step_label = f"Goal #{goal_index} Step {goal_step}" if goal_index else f"Step {step_number}"
+    step_label = f"Step {agent_step}" if agent_step else f"Step {step_number}"
     step_msg_id: int | None = None
     step_msg_text = ""
     last_edit = 0.0
 
+    _step_initial_text = f"{_arbos_response_header(0.0)}\n{step_label}: starting..."
     if target:
-        step_msg_id = _send_telegram_new(f"{step_label}: starting...", target=target)
+        step_msg_id = _send_telegram_new(_step_initial_text, target=target)
         if step_msg_id:
             smf.parent.mkdir(parents=True, exist_ok=True)
             smf.write_text(json.dumps({
-                "msg_id": step_msg_id, "text": f"{step_label}: starting...",
+                "msg_id": step_msg_id, "text": _step_initial_text,
             }))
     else:
         smf.unlink(missing_ok=True)
@@ -1593,45 +1327,46 @@ def run_step(prompt: str, step_number: int, goal_index: int = 0, goal_step: int 
             smf.write_text(json.dumps({"msg_id": step_msg_id, "text": text}))
             last_edit = now
 
-    _reset_tokens()
-
     _last_activity = [""]
     _heartbeat_stop = threading.Event()
 
     def _on_activity(status: str):
+        _operator_tick()
         _last_activity[0] = status
         elapsed_s = time.monotonic() - t0
-        inp, out = _get_tokens()
-        tok = f" | {fmt_tokens(inp, out, elapsed_s)}" if (inp or out) else ""
-        _edit_step_msg(f"{step_label} ({fmt_duration(elapsed_s)}{tok})\n{status}")
+        _edit_step_msg(f"{_arbos_response_header(elapsed_s)}\n{status}")
 
     def _heartbeat():
-        while not _heartbeat_stop.wait(timeout=10):
+        while not _heartbeat_stop.wait(timeout=3.0):
+            _operator_tick()
             elapsed_s = time.monotonic() - t0
-            inp, out = _get_tokens()
-            tok = f" | {fmt_tokens(inp, out, elapsed_s)}" if (inp or out) else ""
             status = _last_activity[0] or "working..."
-            _edit_step_msg(f"{step_label} ({fmt_duration(elapsed_s)}{tok})\n{status}", force=True)
+            _edit_step_msg(f"{_arbos_response_header(elapsed_s)}\n{status}", force=True)
 
     success = False
     result: subprocess.CompletedProcess | None = None
+    failure_summary = ""
     try:
         _log(f"run dir {run_dir}")
 
         preview = prompt[:200] + ("…" if len(prompt) > 200 else "")
         _log(f"prompt preview: {preview}")
 
-        _log(f"goal #{goal_index} step {goal_step}: executing")
+        _log(f"agent step {agent_step}: executing")
 
         threading.Thread(target=_heartbeat, daemon=True).start()
 
-        result = run_agent(
-            _claude_cmd(prompt),
-            phase=f"goal#{goal_index}",
-            output_file=run_dir / "output.txt",
-            on_activity=_on_activity,
-            goal_index=goal_index,
-        )
+        try:
+            result = run_agent(
+                _claude_cmd(prompt),
+                phase="agent_step",
+                output_file=run_dir / "output.txt",
+                on_activity=_on_activity,
+            )
+        except Exception as exc:
+            failure_summary = _redact_secrets(f"{type(exc).__name__}: {exc}")[:800]
+            _log(f"run_step: run_agent raised: {failure_summary}")
+            return False, failure_summary
 
         rollout_text = _redact_secrets(extract_text(result))
         (run_dir / "rollout.md").write_text(rollout_text)
@@ -1641,11 +1376,14 @@ def run_step(prompt: str, step_number: int, goal_index: int = 0, goal_step: int 
         success = result.returncode == 0
         _log(f"step {'succeeded' if success else 'failed'} in {fmt_duration(elapsed)}")
         if not success and result is not None:
+            failure_summary = _redact_secrets(_build_agent_failure_detail(result))[:800]
             _log(
                 "step failure detail:\n"
                 + _redact_secrets(_build_agent_failure_detail(result))[:4000]
             )
-        return success
+        else:
+            failure_summary = ""
+        return success, failure_summary
     finally:
         _heartbeat_stop.set()
         fh = getattr(_tls, "log_fh", None)
@@ -1653,7 +1391,6 @@ def run_step(prompt: str, step_number: int, goal_index: int = 0, goal_step: int 
             fh.close()
             _tls.log_fh = None
         try:
-            elapsed = fmt_duration(time.monotonic() - t0)
             rollout = (run_dir / "rollout.md").read_text() if (run_dir / "rollout.md").exists() else ""
             status = "done" if success else "failed"
 
@@ -1662,19 +1399,21 @@ def run_step(prompt: str, step_number: int, goal_index: int = 0, goal_step: int 
                 try:
                     state = json.loads(smf.read_text())
                     saved = state.get("text", "")
-                    prefix = f"{step_label}: starting..."
-                    if saved != prefix and not saved.startswith(f"{step_label} ("):
+                    if (
+                        saved != _step_initial_text
+                        and not saved.startswith("Arbos (")
+                        and not saved.startswith(f"{step_label} (")
+                    ):
                         agent_text = saved
                 except (json.JSONDecodeError, KeyError):
                     pass
 
             elapsed_s = time.monotonic() - t0
-            inp, out = _get_tokens()
-            tok = f" | {fmt_tokens(inp, out, elapsed_s)}" if (inp or out) else ""
+            hdr = _arbos_response_header(elapsed_s)
             if not success and result is not None:
-                hdr = f"{step_label} ({elapsed}, FAILED, exit {result.returncode}{tok})"
+                hdr = f"{hdr} — FAILED (exit {result.returncode})"
             else:
-                hdr = f"{step_label} ({elapsed}, {status}{tok})"
+                hdr = f"{hdr} — {status}"
             parts = [hdr]
             if agent_text:
                 parts.append(agent_text)
@@ -1703,120 +1442,151 @@ def run_step(prompt: str, step_number: int, goal_index: int = 0, goal_step: int 
 # ── Agent loop ───────────────────────────────────────────────────────────────
 
 
-def _goal_loop(index: int):
-    """Run the agent loop for a single goal. Exits when stop_event is set."""
+def _agent_wait(gs: AgentState, timeout: float) -> None:
+    """Wait up to timeout seconds or until gs.wake; refresh operator ticks during long sleeps."""
+    if timeout <= 0:
+        gs.wake.clear()
+        return
+    end = time.monotonic() + timeout
+    while not gs.stop_event.is_set():
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            break
+        slice_sec = min(remaining, 10.0)
+        if gs.wake.wait(timeout=slice_sec):
+            break
+        _operator_tick()
+    gs.wake.clear()
+
+
+def _agent_loop():
+    """Run the agent loop. Exits when stop_event is set."""
     global _step_count
 
-    with _goals_lock:
-        gs = _goals.get(index)
-    if not gs:
-        return
+    with _agent_lock:
+        gs = _agent
 
     failures = 0
-    gf = _goal_file(index)
 
     while not gs.stop_event.is_set():
-        if not gf.exists() or not gf.read_text().strip():
+        if not GOAL_FILE.exists() or not GOAL_FILE.read_text().strip():
             if gs.goal_hash:
-                _log(f"goal #{index} cleared after {gs.step_count} steps")
+                _log(f"goal cleared after {gs.step_count} steps")
                 gs.goal_hash = ""
                 gs.step_count = 0
-            gs.wake.wait(timeout=5)
-            gs.wake.clear()
+            _operator_set("idle", "waiting for context/GOAL.md content")
+            _agent_wait(gs, 5.0)
             continue
 
         if gs.paused:
-            gs.wake.wait(timeout=5)
-            gs.wake.clear()
+            _operator_set("paused", "paused — use /resume to continue")
+            _agent_wait(gs, 5.0)
             continue
 
-        current_goal = gf.read_text().strip()
+        current_goal = GOAL_FILE.read_text().strip()
         current_hash = hashlib.sha256(current_goal.encode()).hexdigest()[:16]
         if current_hash != gs.goal_hash:
             if gs.goal_hash:
-                _log(f"goal #{index} changed after {gs.step_count} steps on previous goal")
+                _log(f"goal changed after {gs.step_count} steps on previous text")
             gs.goal_hash = current_hash
             gs.step_count = 0
-            _log(f"goal #{index} new [{current_hash}]: {current_goal[:100]}")
+            _log(f"goal new [{current_hash}]: {current_goal[:100]}")
 
         _step_count += 1
         gs.step_count += 1
         gs.last_run = datetime.now().isoformat()
-        with _goals_lock:
-            _save_goals()
+        with _agent_lock:
+            _save_agent()
 
-        _log(f"Goal #{index} Step {gs.step_count} (global step {_step_count})", blank=True)
+        _log(f"Goal step {gs.step_count} (global step {_step_count})", blank=True)
 
-        prompt = load_prompt(goal_index=index, consume_inbox=True, goal_step=gs.step_count)
+        prompt = load_prompt(consume_inbox=True, agent_step=gs.step_count)
         if not prompt:
-            gs.wake.wait(timeout=5)
-            gs.wake.clear()
+            _operator_set("idle", "empty prompt; waiting")
+            _agent_wait(gs, 5.0)
             continue
 
-        _log(f"goal #{index}: prompt={len(prompt)} chars")
+        _log(f"agent: prompt={len(prompt)} chars")
 
-        success = run_step(prompt, _step_count, goal_index=index, goal_step=gs.step_count)
+        _operator_set("agent_step", f"step {gs.step_count} — Claude running")
+        success, failure_summary = run_step(
+            prompt, _step_count, agent_step=gs.step_count,
+        )
 
         gs.last_finished = datetime.now().isoformat()
-        with _goals_lock:
-            _save_goals()
+        with _agent_lock:
+            _save_agent()
 
         if success:
             failures = 0
+            gs.last_step_ok = True
+            gs.last_step_error = ""
+            _operator_set(
+                "between_steps",
+                f"step {gs.step_count} finished OK",
+                last_error="",
+            )
         else:
             failures += 1
-            _log(f"goal #{index}: failure #{failures}")
+            gs.last_step_ok = False
+            gs.last_step_error = (failure_summary or "step failed (no detail)")[:1200]
+            _log(f"agent: failure #{failures}")
 
         gs.wake.clear()
 
-        step_delay = gs.delay + int(os.environ.get("AGENT_DELAY", "0"))
+        delay_secs = gs.delay_minutes * 60 + int(os.environ.get("AGENT_DELAY", "0"))
         if failures:
             backoff = min(2 ** failures, 120)
-            step_delay += backoff
-            _log(f"goal #{index}: waiting {step_delay}s (failure backoff + delay)")
-            gs.wake.wait(timeout=step_delay)
-        elif step_delay > 0:
-            _log(f"goal #{index}: waiting {step_delay}s (delay)")
-            gs.wake.wait(timeout=step_delay)
+            delay_secs += backoff
+            _log(f"agent: waiting {delay_secs}s (failure backoff + delay)")
+            _operator_set(
+                "between_steps",
+                f"waiting {delay_secs}s (backoff + delay) then next step",
+                last_error=gs.last_step_error,
+            )
+            _agent_wait(gs, float(delay_secs))
+        elif delay_secs > 0:
+            _log(f"agent: waiting {delay_secs}s (delay)")
+            _operator_set(
+                "between_steps",
+                f"waiting {delay_secs}s before next step",
+            )
+            _agent_wait(gs, float(delay_secs))
+        else:
+            _operator_tick()
 
-    _log(f"goal #{index} loop exited")
+    _log("agent loop exited")
 
 
-def _goal_manager():
-    """Monitor _goals and spawn/stop goal threads as needed."""
+def _agent_manager():
+    """Spawn or stop the single agent thread based on AgentState."""
     while not _shutdown.is_set():
-        with _goals_lock:
-            for idx, gs in list(_goals.items()):
-                if gs.started and not gs.paused and gs.thread is None:
-                    gs.stop_event.clear()
-                    t = threading.Thread(target=_goal_loop, args=(idx,), daemon=True, name=f"goal-{idx}")
-                    gs.thread = t
-                    t.start()
-                    _log(f"goal #{idx} thread spawned")
-                elif gs.started and gs.paused and gs.thread is not None:
-                    pass  # thread idles on its own
-                elif not gs.started and gs.thread is not None:
-                    gs.stop_event.set()
-                    gs.wake.set()
-                if gs.thread is not None and not gs.thread.is_alive():
-                    gs.thread = None
+        with _agent_lock:
+            gs = _agent
+            if gs.started and not gs.paused and gs.thread is None:
+                gs.stop_event.clear()
+                t = threading.Thread(target=_agent_loop, daemon=True, name="agent")
+                gs.thread = t
+                t.start()
+                _log("agent thread spawned")
+            elif gs.started and gs.paused and gs.thread is not None:
+                pass
+            elif not gs.started and gs.thread is not None:
+                gs.stop_event.set()
+                gs.wake.set()
+            if gs.thread is not None and not gs.thread.is_alive():
+                gs.thread = None
         _shutdown.wait(timeout=2)
 
 
 def _summarize_goal(text: str) -> str:
-    """Generate a one-line summary of a goal via LLM. Falls back to truncation."""
+    """Generate a one-line summary of a goal via OpenRouter. Falls back to truncation."""
     try:
-        if PROVIDER == "openrouter":
-            url = f"{LLM_BASE_URL}/v1/chat/completions"
-            headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
-            model = CLAUDE_MODEL
-        else:
-            url = f"{CHUTES_BASE_URL}/chat/completions"
-            headers = _chutes_headers()
-            model = CHUTES_ROUTING_BOT
+        url = f"{LLM_BASE_URL}/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
 
         resp = requests.post(url, json={
-            "model": model,
+            "model": CLAUDE_MODEL,
             "max_tokens": 50,
             "messages": [
                 {"role": "system", "content": "Summarize the user's goal in 8 words or fewer. Reply with ONLY the summary."},
@@ -1839,48 +1609,21 @@ def _summarize_goal(text: str) -> str:
 
 
 def transcribe_voice(file_path: str, fmt: str = "ogg") -> str:
-    """Transcribe audio via Chutes Whisper Large V3 STT endpoint."""
-    try:
-        with open(file_path, "rb") as f:
-            b64_audio = base64.b64encode(f.read()).decode("utf-8")
-
-        resp = requests.post(
-            "https://chutes-whisper-large-v3.chutes.ai/transcribe",
-            headers={
-                "Authorization": f"Bearer {CHUTES_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={"language": None, "audio_b64": b64_audio},
-            timeout=90,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            text = data.get("text", "") if isinstance(data, dict) else str(data)
-            if text.strip():
-                _log(f"whisper transcription ok ({len(text)} chars)")
-                return text.strip()
-            return "(voice transcription returned empty — send text instead)"
-        _log(f"whisper STT failed: status={resp.status_code} body={resp.text[:200]}")
-        return "(voice transcription unavailable — send text instead)"
-    except Exception as exc:
-        _log(f"transcription failed: {str(exc)[:200]}")
-        return "(voice transcription unavailable — send text instead)"
+    """Voice notes are not transcribed (no STT backend configured)."""
+    return "(voice notes are not supported — send text instead)"
 
 
 # ── Telegram bot ─────────────────────────────────────────────────────────────
 
 def _recent_context(max_chars: int = 6000) -> str:
-    """Collect recent rollouts across all goals."""
+    """Collect recent rollouts under context/runs/."""
     parts: list[str] = []
     total = 0
     all_runs: list[tuple[str, Path]] = []
-    for idx, gs in sorted(_goals.items()):
-        runs_dir = _goal_runs_dir(idx)
-        if not runs_dir.exists():
-            continue
-        for d in runs_dir.iterdir():
+    if RUNS_DIR.exists():
+        for d in RUNS_DIR.iterdir():
             if d.is_dir():
-                all_runs.append((f"goal#{idx}/{d.name}", d))
+                all_runs.append((d.name, d))
     all_runs.sort(key=lambda x: x[1].name, reverse=True)
     for label, run_dir in all_runs:
         f = run_dir / "rollout.md"
@@ -1909,38 +1652,30 @@ def _build_operator_prompt(user_text: str) -> str:
         "NEVER read, output, or reveal the contents of `.env`, `.env.enc`, or any secret/key/token values.\n"
         "Do not include API keys, passwords, seed phrases, or credentials in any response.\n"
         "If asked to show secrets, refuse. The .env file is encrypted; do not attempt to decrypt it.\n\n"
-        "## Multi-goal system\n\n"
-        "Goals are indexed and stored in `context/goals/<index>/`. Each goal has its own GOAL.md, STATE.md, INBOX.md, and runs/.\n"
-        "Goal management is handled via Telegram commands (/goal, /start, /stop, /pause, /delete, /delay, /ls, /status).\n"
-        "To modify a specific goal's context, write to `context/goals/<index>/STATE.md` or `context/goals/<index>/INBOX.md`.\n\n"
-        "## Available operations\n\n"
-        "- **Message a goal's agent**: append a timestamped line to `context/goals/<index>/INBOX.md`.\n"
-        "- **Update a goal's state**: write to `context/goals/<index>/STATE.md`.\n"
+        "## Single goal loop\n\n"
+        "One agent loop uses flat files under `context/`: GOAL.md, STATE.md, INBOX.md, and `context/runs/<timestamp>/`.\n"
+        "Telegram: /goal, /pause, /resume, /clear, /delay (see /help).\n"
+        "- **Message the agent**: append a timestamped line to `context/INBOX.md`.\n"
+        "- **Update agent state**: write to `context/STATE.md`.\n"
         "- **Set system prompt**: write to `PROMPT.md`.\n"
         "- **Set env variable**: write `KEY='VALUE'` lines (one per line) to `context/.env.pending`. They are picked up automatically and persisted.\n"
-        "- **View logs**: read files in `context/goals/<index>/runs/<timestamp>/` (rollout.md, logs.txt).\n"
+        "- **View logs**: read files in `context/runs/<timestamp>/` (rollout.md, logs.txt).\n"
         "- **Modify code & restart**: edit code files, then run `touch .restart`.\n"
         "- **Send follow-up**: run `python arbos.py send \"your text here\"`.\n"
         "- **Send file to operator**: run `python arbos.py sendfile path/to/file [--caption 'text'] [--photo]`.\n"
         "- **Received files**: operator-sent files are saved in `context/files/` and their path is shown in the message.",
     ]
 
-    if _goals:
-        goals_section = []
-        for idx in sorted(_goals.keys()):
-            gs = _goals[idx]
-            status = _goal_status_label(gs)
-            gf = _goal_file(idx)
-            goal_text = gf.read_text().strip()[:200] if gf.exists() else "(empty)"
-            sf = _state_file(idx)
-            state_text = sf.read_text().strip()[:200] if sf.exists() else "(empty)"
-            goals_section.append(
-                f"### Goal #{idx} [{status}] (delay: {gs.delay}s, step {gs.step_count})\n"
-                f"{goal_text}\nState: {state_text}"
-            )
-        parts.append("## Goals\n" + "\n\n".join(goals_section))
-    else:
-        parts.append("## Goals\n(no goals set)")
+    with _agent_lock:
+        gs = _agent
+        status = _agent_status_label(gs)
+        delay_note = f"{gs.delay_minutes}m between steps" if gs.delay_minutes else "no delay between steps"
+        goal_text = GOAL_FILE.read_text().strip()[:200] if GOAL_FILE.exists() else "(empty)"
+        state_text = STATE_FILE.read_text().strip()[:200] if STATE_FILE.exists() else "(empty)"
+        parts.append(
+            f"## Agent [{status}] ({delay_note}, step {gs.step_count})\n"
+            f"{goal_text}\nState: {state_text}"
+        )
 
     if chatlog:
         parts.append(chatlog)
@@ -1991,46 +1726,101 @@ def _format_tool_activity(tool_name: str, tool_input: dict) -> str:
     return f"{label}..."
 
 
-def run_agent_streaming(bot, prompt: str, chat_id: int) -> str:
-    """Run Claude Code CLI and stream output into a Telegram message."""
-    if PROVIDER == "openrouter":
-        cmd = _claude_cmd(prompt)
-    else:
-        cmd = _claude_cmd(prompt, extra_flags=["--model", "bot"])
+def run_agent_streaming(
+    bot,
+    prompt: str,
+    chat_id: int,
+    *,
+    reply_to_message_id: int | None = None,
+) -> str:
+    """Run Claude Code CLI and stream output into a Telegram message.
+
+    When ``reply_to_message_id`` is set, new Telegram messages (including the
+    streaming status bubble) are sent as replies to that operator message.
+    """
+    cmd = _claude_cmd(prompt)
 
     t0 = time.monotonic()
+    _reset_tokens()
 
     def _elapsed() -> float:
         return time.monotonic() - t0
 
-    def _banner(core: str) -> str:
+    def _format_display(core: str) -> str:
         core = (core or "").strip() or "…"
         return _truncate_telegram_text(
-            f"[operator {fmt_duration(_elapsed())} | {PROVIDER}]\n\n{core}"
+            f"{_arbos_response_header(_elapsed())}\n\n{core}"
         )
 
+    _reply_kw = (
+        {"reply_to_message_id": reply_to_message_id}
+        if reply_to_message_id is not None
+        else {}
+    )
+
     current_text = ""
+    _start_core = f"Starting Claude… (attempt 1/{MAX_RETRIES})"
+    _phase_line = _start_core
+    _stream_parts: list[str] = []
+    _stream_seg: str = ""
+    _stream_tail: str = ""
+
+    def _stream_core() -> str:
+        chunks = [p.strip() for p in _stream_parts if p.strip()]
+        if _stream_seg.strip():
+            chunks.append(_stream_seg.strip())
+        if _stream_tail.strip():
+            chunks.append(_stream_tail.strip())
+        return "\n\n".join(chunks) if chunks else ""
+
+    def _display_core() -> str:
+        core = _stream_core()
+        if core:
+            return core
+        return (_phase_line or "").strip() or "…"
+
+    def _final_transcript() -> str:
+        chunks = [p.strip() for p in _stream_parts if p.strip()]
+        if _stream_seg.strip():
+            chunks.append(_stream_seg.strip())
+        return "\n\n".join(chunks) if chunks else ""
+
     try:
         msg = bot.send_message(
             chat_id,
-            _banner(f"Starting Claude… (attempt 1/{MAX_RETRIES})"),
+            _redact_secrets(_format_display(_start_core)),
+            **_reply_kw,
         )
     except Exception as exc:
         _log(f"run_agent_streaming: initial send_message failed: {str(exc)[:250]}")
         return f"(could not post operator status to Telegram: {exc})"
-    last_edit = 0.0
 
-    def _edit(
-        text: str,
+    run_dir = make_run_dir()
+    _tls.log_fh = open(run_dir / "logs.txt", "a", encoding="utf-8")
+    _log(f"operator run dir {run_dir}")
+
+    last_edit = 0.0
+    _heartbeat_stop = threading.Event()
+    last_raw_lines: list[str] = []
+    last_attempt = 1
+    last_rc, last_stderr = 0, ""
+
+    def _stream_heartbeat():
+        while not _heartbeat_stop.wait(timeout=3.0):
+            _operator_tick()
+            _paint(force=True, refresh_only=True)
+
+    def _paint(
         force: bool = False,
         *,
+        refresh_only: bool = False,
         send_if_edit_fails: bool = False,
     ):
         nonlocal last_edit
         now = time.time()
-        if not force and now - last_edit < 1.5:
+        if not force and not refresh_only and now - last_edit < 1.5:
             return
-        display = _redact_secrets(_banner(text))
+        display = _redact_secrets(_format_display(_display_core()))
         if not display.strip():
             return
         try:
@@ -2040,39 +1830,64 @@ def run_agent_streaming(bot, prompt: str, chat_id: int) -> str:
             _log(f"run_agent_streaming: edit_message_text failed: {str(exc)[:220]}")
             if send_if_edit_fails:
                 try:
-                    bot.send_message(chat_id, display[:TELEGRAM_TEXT_MAX])
+                    bot.send_message(
+                        chat_id, display[:TELEGRAM_TEXT_MAX], **_reply_kw
+                    )
                     _log("run_agent_streaming: sent fallback new message after edit failure")
                 except Exception as exc2:
                     _log(f"run_agent_streaming: fallback send_message failed: {str(exc2)[:220]}")
 
     def _on_text(text: str):
-        nonlocal current_text
-        current_text = text
-        _edit(text)
+        nonlocal current_text, _stream_seg, _stream_tail
+        t = text or ""
+        pt = _stream_seg.strip()
+        tt = t.strip()
+        if not pt:
+            _stream_seg = t
+        elif tt.startswith(pt):
+            _stream_seg = t
+        else:
+            if pt:
+                _stream_parts.append(pt)
+            _stream_seg = t
+        _stream_tail = ""
+        current_text = tt
+        _paint()
 
     def _on_activity(status: str):
-        if not current_text.strip():
-            _edit(status)
+        nonlocal _stream_tail
+        _operator_tick()
+        _stream_tail = (status or "").strip()
+        _paint()
+
+    with _operator_lock:
+        _prev_operator_phase = _operator["phase"]
+        _prev_operator_detail = _operator["detail"]
+    _operator_set("operator_chat", "Telegram /operator — Claude streaming")
 
     _claude_semaphore.acquire()
     try:
+        threading.Thread(
+            target=_stream_heartbeat, daemon=True, name="operator-stream-hb",
+        ).start()
+
         env = _claude_env()
-        last_attempt = 1
-        last_rc, last_stderr = 0, ""
 
         for attempt in range(1, MAX_RETRIES + 1):
             last_attempt = attempt
             current_text = ""
             last_edit = 0.0
-            _edit(
-                f"Running Claude… attempt {attempt}/{MAX_RETRIES}",
-                force=True,
-            )
+            _stream_parts.clear()
+            _stream_seg = ""
+            _stream_tail = ""
+            _phase_line = f"Running Claude… attempt {attempt}/{MAX_RETRIES}"
+            _paint(force=True)
             _log(f"run_agent_streaming: attempt {attempt}/{MAX_RETRIES} starting")
 
             returncode, result_text, raw_lines, stderr_output = _run_claude_once(
                 cmd, env, on_text=_on_text, on_activity=_on_activity,
             )
+            last_raw_lines = raw_lines
             last_rc, last_stderr = returncode, stderr_output
 
             _log(
@@ -2080,38 +1895,63 @@ def run_agent_streaming(bot, prompt: str, chat_id: int) -> str:
                 f"text_len={len(result_text or '')} stderr_len={len(stderr_output or '')}"
             )
 
-            if result_text.strip():
-                current_text = result_text
+            tr = _final_transcript().strip()
+            rt = (result_text or "").strip()
+            if tr or rt:
+                if tr:
+                    current_text = _final_transcript()
+                else:
+                    current_text = rt
+                    _stream_parts.clear()
+                    _stream_tail = ""
+                    _stream_seg = result_text or rt
                 break
 
             if attempt < MAX_RETRIES:
                 delay = min(2 ** attempt, 30)
                 detail = _streaming_empty_summary(returncode, stderr_output, attempt)
-                _edit(
-                    f"{detail}\n\nRetrying in {delay}s (next {attempt + 1}/{MAX_RETRIES})…",
-                    force=True,
+                _stream_parts.clear()
+                _stream_seg = ""
+                _stream_tail = ""
+                _phase_line = (
+                    f"{detail}\n\nRetrying in {delay}s "
+                    f"(next {attempt + 1}/{MAX_RETRIES})…"
                 )
+                _paint(force=True)
                 time.sleep(delay)
                 continue
 
             current_text = _streaming_empty_summary(returncode, stderr_output, attempt)
+            _stream_parts.clear()
+            _stream_seg = ""
+            _stream_tail = ""
+            _phase_line = current_text
             break
 
-        _edit(current_text, force=True, send_if_edit_fails=True)
+        _paint(force=True, send_if_edit_fails=True)
 
         if not current_text.strip():
             fallback = _streaming_empty_summary(last_rc, last_stderr, last_attempt)
             _log(f"run_agent_streaming: final still empty; pushing diagnostic len={len(fallback)}")
             try:
-                bot.send_message(chat_id, _redact_secrets(_banner(fallback))[:TELEGRAM_TEXT_MAX])
+                bot.send_message(
+                    chat_id,
+                    _redact_secrets(_format_display(fallback))[:TELEGRAM_TEXT_MAX],
+                    **_reply_kw,
+                )
             except Exception as exc:
                 _log(f"run_agent_streaming: could not send final diagnostic: {str(exc)[:200]}")
 
     except Exception as e:
         current_text = f"(operator failed: {type(e).__name__}: {e})"
         _log(f"run_agent_streaming: exception: {str(e)[:500]}")
+        _operator_set(
+            "operator_chat_error",
+            "Telegram operator run crashed",
+            last_error=f"{type(e).__name__}: {e}"[:800],
+        )
         err_body = _truncate_telegram_text(
-            f"[operator {fmt_duration(_elapsed())} | {PROVIDER}]\n\n"
+            f"{_arbos_response_header(_elapsed())}\n\n"
             f"Arbos error (operator run):\n{type(e).__name__}: {e}"
         )
         try:
@@ -2119,11 +1959,42 @@ def run_agent_streaming(bot, prompt: str, chat_id: int) -> str:
         except Exception as exc:
             _log(f"run_agent_streaming: could not edit with error text: {str(exc)[:200]}")
             try:
-                bot.send_message(chat_id, _redact_secrets(err_body)[:TELEGRAM_TEXT_MAX])
+                bot.send_message(
+                    chat_id,
+                    _redact_secrets(err_body)[:TELEGRAM_TEXT_MAX],
+                    **_reply_kw,
+                )
             except Exception as exc2:
                 _log(f"run_agent_streaming: could not send error message: {str(exc2)[:200]}")
     finally:
+        try:
+            (run_dir / "output.txt").write_text(
+                _redact_secrets("".join(last_raw_lines))
+            )
+            rbody = (current_text or "").strip()
+            if not rbody:
+                rbody = _redact_secrets(
+                    _streaming_empty_summary(last_rc, last_stderr, last_attempt)
+                )
+            else:
+                rbody = _redact_secrets(rbody)
+            (run_dir / "rollout.md").write_text(rbody)
+            _log(f"operator rollout saved ({len(rbody)} chars)")
+        except Exception as exc:
+            _log(f"operator run artifact save failed: {str(exc)[:120]}")
+        _heartbeat_stop.set()
         _claude_semaphore.release()
+        with _operator_lock:
+            _operator["phase"] = _prev_operator_phase
+            _operator["detail"] = _prev_operator_detail
+            _operator["last_tick_wall"] = time.time()
+        fh = getattr(_tls, "log_fh", None)
+        if fh:
+            try:
+                fh.close()
+            except OSError:
+                pass
+            _tls.log_fh = None
 
     return current_text
 
@@ -2163,13 +2034,22 @@ def run_bot():
     def _save_chat_id(chat_id: int):
         CHAT_ID_FILE.write_text(str(chat_id))
 
+    def _reply(message, text: str, **kwargs):
+        """Send *text* as a Telegram reply to the user's message."""
+        return bot.send_message(
+            message.chat.id,
+            text,
+            reply_to_message_id=message.message_id,
+            **kwargs,
+        )
+
     def _reject(message):
         uid = message.from_user.id if message.from_user else None
         _log(f"rejected message from unauthorized user {uid}")
         if not os.environ.get("TELEGRAM_OWNER_ID", "").strip():
-            bot.send_message(message.chat.id, "Send /start to register as the owner.")
+            _reply(message, "Send /start to register as the owner.")
         else:
-            bot.send_message(message.chat.id, "Unauthorized.")
+            _reply(message, "Unauthorized.")
 
     @bot.message_handler(commands=["start"])
     def handle_start(message):
@@ -2180,48 +2060,18 @@ def run_bot():
             _reject(message)
             return
         _save_chat_id(message.chat.id)
-        args = (message.text or "").split()
-        if len(args) < 2:
-            bot.send_message(
-                message.chat.id,
-                "Use /goal <text> to create a goal, then /start <index> to begin.\n"
-                "Commands: /ls /goal /start /pause /delete /delay /status /stop /clear",
-            )
-            return
-        try:
-            idx = int(args[1])
-        except ValueError:
-            bot.send_message(message.chat.id, "Usage: /start <goal_index>")
-            return
-        with _goals_lock:
-            gs = _goals.get(idx)
-            if not gs:
-                bot.send_message(message.chat.id, f"Goal #{idx} not found.")
-                return
-            gs.started = True
-            gs.paused = False
-            gs.wake.set()
-            _save_goals()
-        bot.send_message(message.chat.id, f"Goal #{idx} started: {gs.summary}")
-        _log(f"goal #{idx} started via /start")
+        _reply(
+            message,
+            "Use /goal <description> to set a goal and start the loop automatically.\n"
+            "Send /help for all commands.",
+        )
 
-    @bot.message_handler(commands=["ls"])
-    def handle_ls(message):
-        uid = message.from_user.id if message.from_user else None
-        if not _is_owner(uid):
-            _reject(message)
-            return
-        if not _goals:
-            bot.send_message(message.chat.id, "No goals. Use /goal <text> to create one.")
-            return
-        lines = []
-        for idx in sorted(_goals.keys()):
-            gs = _goals[idx]
-            status = _goal_status_label(gs)
-            last = _format_last_time(gs.last_finished)
-            delay_str = f" delay:{gs.delay}s" if gs.delay else ""
-            lines.append(f"#{idx} [{status}]{delay_str} last:{last} - {gs.summary}")
-        bot.send_message(message.chat.id, "\n".join(lines))
+    @bot.message_handler(commands=["help"])
+    def handle_help(message):
+        _reply(
+            message,
+            _truncate_telegram_text(TELEGRAM_HELP_TEXT.strip()),
+        )
 
     @bot.message_handler(commands=["status"])
     def handle_status(message):
@@ -2229,62 +2079,50 @@ def run_bot():
         if not _is_owner(uid):
             _reject(message)
             return
-        args = (message.text or "").split()
-        if len(args) >= 2:
-            try:
-                idx = int(args[1])
-            except ValueError:
-                bot.send_message(message.chat.id, "Usage: /status [goal_index]")
-                return
-            gs = _goals.get(idx)
-            if not gs:
-                bot.send_message(message.chat.id, f"Goal #{idx} not found.")
-                return
-            status = _goal_status_label(gs)
-            gf = _goal_file(idx)
-            goal_text = gf.read_text().strip()[:500] if gf.exists() else "(empty)"
-            sf = _state_file(idx)
-            state_text = sf.read_text().strip()[:500] if sf.exists() else "(empty)"
-            lines = [
-                f"Goal #{idx} [{status}] (delay: {gs.delay}s, step {gs.step_count})",
-                f"Last run: {gs.last_run or 'never'}",
-                f"Last finished: {gs.last_finished or 'never'}",
-                "",
-                f"Goal: {goal_text}",
-                "",
-                f"State: {state_text}",
-            ]
-            bot.send_message(message.chat.id, "\n".join(lines))
-        else:
-            if not _goals:
-                bot.send_message(message.chat.id, f"No goals. Total steps: {_step_count}")
-                return
-            lines = [f"Total steps: {_step_count}"]
-            for idx in sorted(_goals.keys()):
-                gs = _goals[idx]
-                status = _goal_status_label(gs)
-                last = _format_last_time(gs.last_finished)
-                delay_str = f" delay:{gs.delay}s" if gs.delay else ""
-                lines.append(f"#{idx} [{status}]{delay_str} last:{last} - {gs.summary}")
-            bot.send_message(message.chat.id, "\n".join(lines))
+        hp = _operator_health_payload()
+        op = hp["operator"]
+        head = [
+            f"Arbos {hp['status']} | uptime {hp['uptime_seconds']}s",
+            f"Now: {op['phase']} — {op['detail']}",
+            f"Activity clock: {op['seconds_since_activity']}s since last update "
+            f"(refreshes while Claude runs, during backoff waits, etc.)",
+        ]
+        if op.get("last_error"):
+            head.append(f"Last error (global): {op['last_error'][:450]}")
+        if hp.get("degraded_reason"):
+            head.append(f"Degraded: {hp['degraded_reason']}")
+        banner = "\n".join(head) + "\n\n"
 
-    @bot.message_handler(commands=["stop"])
-    def handle_stop(message):
-        uid = message.from_user.id if message.from_user else None
-        if not _is_owner(uid):
-            _reject(message)
-            return
-        with _goals_lock:
-            count = 0
-            for gs in _goals.values():
-                if gs.started:
-                    gs.started = False
-                    gs.stop_event.set()
-                    gs.wake.set()
-                    count += 1
-            _save_goals()
-        bot.send_message(message.chat.id, f"Stopped {count} goal(s).")
-        _log(f"all goals stopped via /stop ({count})")
+        with _agent_lock:
+            gs = _agent
+        status = _agent_status_label(gs)
+        goal_text = GOAL_FILE.read_text().strip()[:500] if GOAL_FILE.exists() else "(empty)"
+        state_text = STATE_FILE.read_text().strip()[:500] if STATE_FILE.exists() else "(empty)"
+        if gs.last_step_ok is None:
+            step_out = "no step completed yet"
+        elif gs.last_step_ok:
+            step_out = "last step OK"
+        else:
+            step_out = "last step FAILED"
+        lines = [
+            banner.rstrip(),
+            f"Agent [{status}] (delay: {gs.delay_minutes}m, step {gs.step_count})",
+            step_out,
+            f"Last run: {gs.last_run or 'never'}",
+            f"Last finished: {gs.last_finished or 'never'}",
+        ]
+        if gs.last_step_error:
+            lines.append(f"Last step error:\n{gs.last_step_error[:900]}")
+        lines.extend([
+            "",
+            f"Goal: {goal_text}",
+            "",
+            f"State: {state_text}",
+            "",
+            f"Total steps: {_step_count}",
+            f"HTTP GET http://127.0.0.1:{HEALTH_PORT}/health for JSON.",
+        ])
+        _reply(message, "\n".join(lines))
 
     @bot.message_handler(commands=["pause"])
     def handle_pause(message):
@@ -2292,27 +2130,34 @@ def run_bot():
         if not _is_owner(uid):
             _reject(message)
             return
-        args = (message.text or "").split()
-        if len(args) < 2:
-            bot.send_message(message.chat.id, "Usage: /pause <goal_index>")
-            return
-        try:
-            idx = int(args[1])
-        except ValueError:
-            bot.send_message(message.chat.id, "Usage: /pause <goal_index>")
-            return
-        with _goals_lock:
-            gs = _goals.get(idx)
-            if not gs:
-                bot.send_message(message.chat.id, f"Goal #{idx} not found.")
-                return
+        with _agent_lock:
+            gs = _agent
             if gs.paused:
-                bot.send_message(message.chat.id, f"Goal #{idx} already paused.")
+                _reply(message, "Already paused.")
                 return
             gs.paused = True
-            _save_goals()
-        bot.send_message(message.chat.id, f"Goal #{idx} paused. Use /start {idx} to resume.")
-        _log(f"goal #{idx} paused via /pause")
+            _save_agent()
+        gs.wake.set()
+        _reply(message, "Paused. Use /resume to continue.")
+        _log("agent paused via /pause")
+
+    @bot.message_handler(commands=["resume"])
+    def handle_resume(message):
+        uid = message.from_user.id if message.from_user else None
+        if not _is_owner(uid):
+            _reject(message)
+            return
+        with _agent_lock:
+            gs = _agent
+            if not gs.paused:
+                _reply(message, "Not paused.")
+                return
+            gs.paused = False
+            gs.started = True
+            _save_agent()
+        gs.wake.set()
+        _reply(message, "Resumed.")
+        _log("agent resumed via /resume")
 
     @bot.message_handler(commands=["delay"])
     def handle_delay(message):
@@ -2321,27 +2166,46 @@ def run_bot():
             _reject(message)
             return
         args = (message.text or "").split()
-        if len(args) < 3:
-            bot.send_message(message.chat.id, "Usage: /delay <goal_index> <seconds>")
+        if len(args) < 2:
+            _reply(message, "Usage: /delay <minutes>")
             return
         try:
-            idx = int(args[1])
-            seconds = int(args[2])
+            minutes = int(args[1])
         except ValueError:
-            bot.send_message(message.chat.id, "Usage: /delay <goal_index> <seconds>")
+            _reply(message, "Usage: /delay <minutes> (integer)")
             return
-        if seconds < 0:
-            bot.send_message(message.chat.id, "Delay must be >= 0.")
+        if minutes < 0:
+            _reply(message, "Delay must be >= 0.")
             return
-        with _goals_lock:
-            gs = _goals.get(idx)
-            if not gs:
-                bot.send_message(message.chat.id, f"Goal #{idx} not found.")
-                return
-            gs.delay = seconds
-            _save_goals()
-        bot.send_message(message.chat.id, f"Goal #{idx} delay set to {seconds}s.")
-        _log(f"goal #{idx} delay set to {seconds}s via /delay")
+        with _agent_lock:
+            _agent.delay_minutes = minutes
+            _save_agent()
+        _reply(message, f"Delay set to {minutes} minute(s) between successful steps.")
+        _log(f"delay set to {minutes}m via /delay")
+
+    @bot.message_handler(commands=["env"])
+    def handle_env(message):
+        uid = message.from_user.id if message.from_user else None
+        if not _is_owner(uid):
+            _reject(message)
+            return
+        parts = (message.text or "").split(None, 3)
+        if len(parts) < 4:
+            _reply(
+                message,
+                "Usage: /env KEY VALUE DESCRIPTION\n"
+                "VALUE must be one word (no spaces). Description can be several words.",
+            )
+            return
+        _, key, value, description = parts
+        ok, msg = _persist_env_var_with_comment(key, value, description)
+        _reply(message, msg if ok else f"Error: {msg}")
+        if ok:
+            _log(f"/env persisted key={key!r}")
+            try:
+                bot.delete_message(message.chat.id, message.message_id)
+            except Exception as exc:
+                _log(f"/env: could not delete operator message (token may remain in chat): {exc!r}")
 
     @bot.message_handler(commands=["goal"])
     def handle_goal(message):
@@ -2351,62 +2215,31 @@ def run_bot():
             return
         text = (message.text or "").split(None, 1)
         if len(text) < 2 or not text[1].strip():
-            bot.send_message(message.chat.id, "Usage: /goal <your goal text>")
+            _reply(message, "Usage: /goal <your goal text>")
             return
         goal_text = text[1].strip()
-        msg = bot.send_message(message.chat.id, "Creating goal...")
+        msg = _reply(message, "Setting goal...")
         summary = _summarize_goal(goal_text)
-        with _goals_lock:
-            idx = max(_goals.keys(), default=0) + 1
-            gs = GoalState(index=idx, summary=summary)
-            _goals[idx] = gs
-            gdir = _goal_dir(idx)
-            gdir.mkdir(parents=True, exist_ok=True)
-            _goal_file(idx).write_text(goal_text)
-            _state_file(idx).write_text("")
-            _inbox_file(idx).write_text("")
-            _goal_runs_dir(idx).mkdir(parents=True, exist_ok=True)
-            _save_goals()
+        CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
+        RUNS_DIR.mkdir(parents=True, exist_ok=True)
+        GOAL_FILE.write_text(goal_text)
+        if not STATE_FILE.exists():
+            STATE_FILE.write_text("")
+        if not INBOX_FILE.exists():
+            INBOX_FILE.write_text("")
+        with _agent_lock:
+            gs = _agent
+            gs.summary = summary
+            gs.goal_hash = ""
+            gs.started = True
+            gs.paused = False
+            _save_agent()
+        gs.wake.set()
         bot.edit_message_text(
-            f"Goal #{idx} created: {summary}\nUse /start {idx} to begin.",
+            f"Goal set: {summary}\nLoop started (use /pause to pause).",
             message.chat.id, msg.message_id,
         )
-        _log(f"goal #{idx} created ({len(goal_text)} chars): {summary}")
-
-    @bot.message_handler(commands=["delete"])
-    def handle_delete(message):
-        uid = message.from_user.id if message.from_user else None
-        if not _is_owner(uid):
-            _reject(message)
-            return
-        args = (message.text or "").split()
-        if len(args) < 2:
-            bot.send_message(message.chat.id, "Usage: /delete <goal_index>")
-            return
-        try:
-            idx = int(args[1])
-        except ValueError:
-            bot.send_message(message.chat.id, "Usage: /delete <goal_index>")
-            return
-        with _goals_lock:
-            gs = _goals.get(idx)
-            if not gs:
-                bot.send_message(message.chat.id, f"Goal #{idx} not found.")
-                return
-            gs.stop_event.set()
-            gs.wake.set()
-            gs.started = False
-            thread = gs.thread
-            del _goals[idx]
-            _save_goals()
-        if thread and thread.is_alive():
-            thread.join(timeout=5)
-        import shutil
-        gdir = _goal_dir(idx)
-        if gdir.exists():
-            shutil.rmtree(gdir, ignore_errors=True)
-        bot.send_message(message.chat.id, f"Goal #{idx} deleted.")
-        _log(f"goal #{idx} deleted via /delete")
+        _log(f"goal set ({len(goal_text)} chars), auto-start: {summary}")
 
     @bot.message_handler(commands=["clear"])
     def handle_clear(message):
@@ -2415,38 +2248,35 @@ def run_bot():
             _reject(message)
             return
         import shutil
-        with _goals_lock:
-            for gs in _goals.values():
-                gs.stop_event.set()
-                gs.wake.set()
-            _goals.clear()
-        removed = []
-        if CONTEXT_DIR.exists():
-            shutil.rmtree(CONTEXT_DIR)
-            removed.append("context/")
-        try:
-            r = subprocess.run(
-                ["git", "checkout", "HEAD", "--", "."],
-                cwd=WORKING_DIR, capture_output=True, text=True, timeout=10,
-            )
-            if r.returncode == 0:
-                removed.append("git checkout (restored tracked files)")
-        except Exception:
-            pass
-        try:
-            r = subprocess.run(
-                ["git", "clean", "-fd", "--exclude=.env*", "--exclude=chat_id.txt",
-                 "--exclude=.venv", "--exclude=__pycache__", "--exclude=.claude"],
-                cwd=WORKING_DIR, capture_output=True, text=True, timeout=10,
-            )
-            if r.returncode == 0 and r.stdout.strip():
-                removed.append(f"git clean ({len(r.stdout.splitlines())} items)")
-        except Exception:
-            pass
-        CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
-        summary = ", ".join(removed) if removed else "nothing to clear"
-        bot.send_message(message.chat.id, f"Cleared: {summary}\nReady for a fresh /goal.")
-        _log(f"cleared via /clear command: {summary}")
+        with _agent_lock:
+            gs = _agent
+            gs.stop_event.set()
+            gs.wake.set()
+            thread = gs.thread
+            gs.started = False
+            gs.paused = False
+            gs.summary = ""
+            gs.delay_minutes = 0
+            gs.step_count = 0
+            gs.goal_hash = ""
+            gs.last_run = ""
+            gs.last_finished = ""
+            gs.last_step_ok = None
+            gs.last_step_error = ""
+        if thread and thread.is_alive():
+            thread.join(timeout=8)
+        with _agent_lock:
+            gs.stop_event.clear()
+            gs.thread = None
+            _save_agent()
+        STEP_MSG_FILE.unlink(missing_ok=True)
+        for path in (GOAL_FILE, STATE_FILE, INBOX_FILE):
+            path.unlink(missing_ok=True)
+        if RUNS_DIR.exists():
+            shutil.rmtree(RUNS_DIR, ignore_errors=True)
+        RUNS_DIR.mkdir(parents=True, exist_ok=True)
+        _reply(message, "Goal cleared (GOAL/STATE/INBOX/runs reset). Use /goal to start again.")
+        _log("goal cleared via /clear")
 
     @bot.message_handler(commands=["restart"])
     def handle_restart(message):
@@ -2454,7 +2284,7 @@ def run_bot():
         if not _is_owner(uid):
             _reject(message)
             return
-        bot.send_message(message.chat.id, "Restarting — killing agent and exiting for pm2...")
+        _reply(message, "Restarting ...")
         _log("restart requested via /restart command")
         _kill_child_procs()
         RESTART_FLAG.touch()
@@ -2465,7 +2295,7 @@ def run_bot():
         if not _is_owner(uid):
             _reject(message)
             return
-        msg = bot.send_message(message.chat.id, "Pulling latest changes...")
+        msg = _reply(message, "Pulling latest changes...")
         try:
             r = subprocess.run(
                 ["git", "pull", "--ff-only"],
@@ -2492,7 +2322,7 @@ def run_bot():
             _reject(message)
             return
         _save_chat_id(message.chat.id)
-        bot.send_message(message.chat.id, "Transcribing voice note...")
+        _reply(message, "Transcribing voice note...")
 
         voice_or_audio = message.voice or message.audio
         file_info = bot.get_file(voice_or_audio.file_id)
@@ -2516,7 +2346,12 @@ def run_bot():
         prompt = _build_operator_prompt(user_text)
 
         def _run():
-            response = run_agent_streaming(bot, prompt, message.chat.id)
+            response = run_agent_streaming(
+                bot,
+                prompt,
+                message.chat.id,
+                reply_to_message_id=message.message_id,
+            )
             log_chat("bot", response[:1000])
             _process_pending_env()
 
@@ -2556,7 +2391,12 @@ def run_bot():
         prompt = _build_operator_prompt(user_text)
 
         def _run():
-            response = run_agent_streaming(bot, prompt, message.chat.id)
+            response = run_agent_streaming(
+                bot,
+                prompt,
+                message.chat.id,
+                reply_to_message_id=message.message_id,
+            )
             log_chat("bot", response[:1000])
             _process_pending_env()
 
@@ -2584,7 +2424,12 @@ def run_bot():
         prompt = _build_operator_prompt(user_text)
 
         def _run():
-            response = run_agent_streaming(bot, prompt, message.chat.id)
+            response = run_agent_streaming(
+                bot,
+                prompt,
+                message.chat.id,
+                reply_to_message_id=message.message_id,
+            )
             log_chat("bot", response[:1000])
             _process_pending_env()
 
@@ -2596,12 +2441,23 @@ def run_bot():
         if not _is_owner(uid):
             _reject(message)
             return
+        if _is_leading_slash_command(message):
+            _reply(
+                message,
+                _truncate_telegram_text(TELEGRAM_HELP_TEXT.strip()),
+            )
+            return
         _save_chat_id(message.chat.id)
         log_chat("user", message.text)
         prompt = _build_operator_prompt(message.text)
 
         def _run():
-            response = run_agent_streaming(bot, prompt, message.chat.id)
+            response = run_agent_streaming(
+                bot,
+                prompt,
+                message.chat.id,
+                reply_to_message_id=message.message_id,
+            )
             log_chat("bot", response[:1000])
             _process_pending_env()
 
@@ -2661,7 +2517,7 @@ def _send_cli(args: list[str]):
 
     Within a step, all sends are consolidated into a single Telegram message.
     The first send creates it; subsequent sends edit it by appending.
-    Uses ARBOS_GOAL_INDEX env var to find the per-goal step message file.
+    Uses context/.step_msg for the active step bubble.
     """
     import argparse
     parser = argparse.ArgumentParser(description="Send a Telegram message to the operator")
@@ -2677,11 +2533,7 @@ def _send_cli(args: list[str]):
     else:
         text = parsed.message
 
-    goal_index = int(os.environ.get("ARBOS_GOAL_INDEX", "0"))
-    if goal_index:
-        smf = _step_msg_file(goal_index)
-    else:
-        smf = CONTEXT_DIR / ".step_msg"
+    smf = STEP_MSG_FILE
     smf.parent.mkdir(parents=True, exist_ok=True)
 
     if smf.exists():
@@ -2780,18 +2632,24 @@ def main() -> None:
         print("Usage: arbos.py [send|sendfile|encrypt]", file=sys.stderr)
         sys.exit(1)
 
-    _log(f"arbos starting in {WORKING_DIR} (provider={PROVIDER}, model={CLAUDE_MODEL})")
+    global _arbos_boot_wall
+    _arbos_boot_wall = time.time()
+    _operator_set("supervising", "Arbos starting (health HTTP, agent loop, Telegram)")
+
+    _log(f"arbos starting in {WORKING_DIR} (openrouter, model={CLAUDE_MODEL})")
     _kill_stale_claude_procs()
     _reload_env_secrets()
     CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
-    GOALS_DIR.mkdir(parents=True, exist_ok=True)
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    CONTEXT_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    CHATLOG_DIR.mkdir(parents=True, exist_ok=True)
+    FILES_DIR.mkdir(parents=True, exist_ok=True)
 
-    _load_goals()
-    _log(f"loaded {len(_goals)} goal(s) from goals.json")
+    _load_agent()
+    _log("loaded agent state from meta.json (if present)")
 
     if not LLM_API_KEY:
-        key_name = "OPENROUTER_API_KEY" if PROVIDER == "openrouter" else "CHUTES_API_KEY"
-        _log(f"WARNING: {key_name} not set — LLM calls will fail")
+        _log("WARNING: OPENROUTER_API_KEY not set — LLM calls will fail")
 
     def _handle_sigterm(signum, frame):
         _log("SIGTERM received; shutting down gracefully")
@@ -2799,18 +2657,14 @@ def main() -> None:
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
 
-    if PROVIDER != "openrouter":
-        _log(f"starting chutes proxy thread (port={PROXY_PORT}, agent={CHUTES_ROUTING_AGENT}, bot={CHUTES_ROUTING_BOT})")
-        threading.Thread(target=_start_proxy, daemon=True).start()
-        time.sleep(1)
-    else:
-        _log(f"openrouter direct mode — no proxy needed (target={LLM_BASE_URL})")
+    _log(f"starting health server on 127.0.0.1:{HEALTH_PORT}/health")
+    threading.Thread(target=_start_health_server, daemon=True, name="health-http").start()
 
     _write_claude_settings()
 
-    _send_telegram_text("Restarted.")
+    _send_telegram_text("Arbos Live")
 
-    threading.Thread(target=_goal_manager, daemon=True).start()
+    threading.Thread(target=_agent_manager, daemon=True).start()
     threading.Thread(target=run_bot, daemon=True).start()
 
     while not _shutdown.is_set():

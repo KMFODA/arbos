@@ -312,7 +312,15 @@ pm2 save 2>/dev/null || true
 
 # ── Done ─────────────────────────────────────────────────────────────────
 printf "\n"
-printf "  ${GREEN}${BOLD}Arbos is live${NC}\n"
+printf "  ${GREEN}${BOLD}Arbos${NC}\n"
+printf "\n"
+printf "  /loop GOAL.md\n"
+printf "  /pause (pause loop)\n"
+printf "  /resume (resume loop)\n"
+printf "  /clear (clear loop)\n"
+printf "  /delay <mins> (loop delay)\n"
+printf "  /restart (restart Arbos)\n"
+printf "  /env KEY VAL DESC (add env)\n"
 printf "\n"
 
 sleep 2

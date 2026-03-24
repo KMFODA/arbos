@@ -571,7 +571,7 @@ def load_prompt(consume_inbox: bool = False, agent_step: int = 0) -> str:
     if GOAL_FILE.exists():
         goal_text = GOAL_FILE.read_text().strip()
         if goal_text:
-            header = f"## Goal (step {agent_step})" if agent_step else "## Goal"
+            header = f"## Loop (step {agent_step})" if agent_step else "## Loop"
             parts.append(
                 f"{header}\n\n{goal_text}\n\n"
                 "Your context files are under context/: STATE.md, INBOX.md, runs/, "
@@ -661,27 +661,15 @@ def load_chatlog(max_chars: int = 8000) -> str:
 TELEGRAM_TEXT_MAX = 4096
 TELEGRAM_SAFE_TEXT = 3900
 
-TELEGRAM_HELP_TEXT = f"""\
-Arbos — Telegram commands
-
-Goal loop
-/goal <description> — set the goal and start the loop automatically
-/pause — pause stepping
-/resume — resume stepping
-/clear — clear goal files and reset agent state
-/delay <mins> — minutes to wait between successful steps
-
-Other
-/start — register as owner (first time) or show this help
-/status — snapshot (JSON: GET http://127.0.0.1:{HEALTH_PORT}/health)
-/restart — exit for pm2 to restart the agent
-/update — git pull --ff-only, then restart
-/env KEY VALUE DESCRIPTION — set or update one env var (VALUE = single token, no spaces)
-
-Operator
-Send text, a photo, or a document to talk to the Claude operator (voice notes are not transcribed).
-
-First use: /start registers you as owner if none is set yet.
+TELEGRAM_HELP_TEXT = """\
+Arbos:
+- /loop GOAL.md
+- /pause
+- /resume
+- /clear
+- /delay <mins>
+- /restart
+- /env KEY VAL DESC
 """
 
 
@@ -1498,7 +1486,7 @@ def _agent_loop():
         with _agent_lock:
             _save_agent()
 
-        _log(f"Goal step {gs.step_count} (global step {_step_count})", blank=True)
+        _log(f"Loop step {gs.step_count} (global step {_step_count})", blank=True)
 
         prompt = load_prompt(consume_inbox=True, agent_step=gs.step_count)
         if not prompt:
@@ -1652,9 +1640,9 @@ def _build_operator_prompt(user_text: str) -> str:
         "NEVER read, output, or reveal the contents of `.env`, `.env.enc`, or any secret/key/token values.\n"
         "Do not include API keys, passwords, seed phrases, or credentials in any response.\n"
         "If asked to show secrets, refuse. The .env file is encrypted; do not attempt to decrypt it.\n\n"
-        "## Single goal loop\n\n"
+        "## Single agent loop\n\n"
         "One agent loop uses flat files under `context/`: GOAL.md, STATE.md, INBOX.md, and `context/runs/<timestamp>/`.\n"
-        "Telegram: /goal, /pause, /resume, /clear, /delay (see /help).\n"
+        "Telegram: /loop, /pause, /resume, /clear, /delay (see /help).\n"
         "- **Message the agent**: append a timestamped line to `context/INBOX.md`.\n"
         "- **Update agent state**: write to `context/STATE.md`.\n"
         "- **Set system prompt**: write to `PROMPT.md`.\n"
@@ -1733,10 +1721,15 @@ def run_agent_streaming(
     *,
     reply_to_message_id: int | None = None,
 ) -> str:
-    """Run Claude Code CLI and stream output into a Telegram message.
+    """Run Claude Code CLI and stream output into Telegram.
+
+    The *active* segment is updated with ``editMessageText``. When the CLI
+    starts a new assistant segment (non-prefix text), the previous segment is
+    left frozen in its bubble and a new message is sent so the chat shows the
+    full rollout (each bubble up to Telegram's size limit).
 
     When ``reply_to_message_id`` is set, new Telegram messages (including the
-    streaming status bubble) are sent as replies to that operator message.
+    initial status bubble) are sent as replies to that operator message.
     """
     cmd = _claude_cmd(prompt)
 
@@ -1761,12 +1754,12 @@ def run_agent_streaming(
     current_text = ""
     _start_core = f"Starting Claude… (attempt 1/{MAX_RETRIES})"
     _phase_line = _start_core
-    _stream_parts: list[str] = []
+    _segment_done: list[str] = []
     _stream_seg: str = ""
     _stream_tail: str = ""
 
     def _stream_core() -> str:
-        chunks = [p.strip() for p in _stream_parts if p.strip()]
+        chunks = []
         if _stream_seg.strip():
             chunks.append(_stream_seg.strip())
         if _stream_tail.strip():
@@ -1780,7 +1773,7 @@ def run_agent_streaming(
         return (_phase_line or "").strip() or "…"
 
     def _final_transcript() -> str:
-        chunks = [p.strip() for p in _stream_parts if p.strip()]
+        chunks = [s.strip() for s in _segment_done if s.strip()]
         if _stream_seg.strip():
             chunks.append(_stream_seg.strip())
         return "\n\n".join(chunks) if chunks else ""
@@ -1798,6 +1791,13 @@ def run_agent_streaming(
     run_dir = make_run_dir()
     _tls.log_fh = open(run_dir / "logs.txt", "a", encoding="utf-8")
     _log(f"operator run dir {run_dir}")
+    _pp = _redact_secrets(prompt[:200] + ("…" if len(prompt) > 200 else ""))
+    _log(f"operator prompt preview: {_pp}")
+    _rto = reply_to_message_id
+    _log(
+        f"operator meta: model={CLAUDE_MODEL} chat_id={chat_id}"
+        + (f" reply_to_message_id={_rto}" if _rto is not None else "")
+    )
 
     last_edit = 0.0
     _heartbeat_stop = threading.Event()
@@ -1816,7 +1816,7 @@ def run_agent_streaming(
         refresh_only: bool = False,
         send_if_edit_fails: bool = False,
     ):
-        nonlocal last_edit
+        nonlocal last_edit, msg
         now = time.time()
         if not force and not refresh_only and now - last_edit < 1.5:
             return
@@ -1837,21 +1837,50 @@ def run_agent_streaming(
                 except Exception as exc2:
                     _log(f"run_agent_streaming: fallback send_message failed: {str(exc2)[:220]}")
 
+    def _freeze_segment_and_new_message(completed: str, new_seg_raw: str) -> None:
+        """Leave *completed* in the current bubble; open a new message for *new_seg_raw*."""
+        nonlocal msg
+        c = (completed or "").strip()
+        if c:
+            body = _redact_secrets(_format_display(c))
+            try:
+                bot.edit_message_text(body, chat_id, msg.message_id)
+            except Exception as exc:
+                _log(f"run_agent_streaming: freeze-segment edit failed: {str(exc)[:220]}")
+                try:
+                    bot.send_message(
+                        chat_id, body[:TELEGRAM_TEXT_MAX], **_reply_kw
+                    )
+                    _log("run_agent_streaming: freeze segment sent as new message after edit fail")
+                except Exception as exc2:
+                    _log(
+                        f"run_agent_streaming: freeze segment send_message failed: "
+                        f"{str(exc2)[:220]}"
+                    )
+            _segment_done.append(c)
+        core_new = (new_seg_raw or "").strip() or "…"
+        try:
+            msg = bot.send_message(
+                chat_id,
+                _redact_secrets(_format_display(core_new)),
+                **_reply_kw,
+            )
+        except Exception as exc:
+            _log(f"run_agent_streaming: new-segment send_message failed: {str(exc)[:250]}")
+
     def _on_text(text: str):
-        nonlocal current_text, _stream_seg, _stream_tail
+        nonlocal _stream_seg, _stream_tail
         t = text or ""
         pt = _stream_seg.strip()
         tt = t.strip()
+        _stream_tail = ""
         if not pt:
             _stream_seg = t
         elif tt.startswith(pt):
             _stream_seg = t
         else:
-            if pt:
-                _stream_parts.append(pt)
+            _freeze_segment_and_new_message(pt, t)
             _stream_seg = t
-        _stream_tail = ""
-        current_text = tt
         _paint()
 
     def _on_activity(status: str):
@@ -1877,23 +1906,37 @@ def run_agent_streaming(
             last_attempt = attempt
             current_text = ""
             last_edit = 0.0
-            _stream_parts.clear()
+            _segment_done.clear()
             _stream_seg = ""
             _stream_tail = ""
-            _phase_line = f"Running Claude… attempt {attempt}/{MAX_RETRIES}"
+            _phase_line = "Thinking ..."
             _paint(force=True)
             _log(f"run_agent_streaming: attempt {attempt}/{MAX_RETRIES} starting")
+            t_attempt = time.monotonic()
 
             returncode, result_text, raw_lines, stderr_output = _run_claude_once(
                 cmd, env, on_text=_on_text, on_activity=_on_activity,
             )
             last_raw_lines = raw_lines
             last_rc, last_stderr = returncode, stderr_output
+            attempt_s = time.monotonic() - t_attempt
 
             _log(
                 f"run_agent_streaming: attempt {attempt} finished rc={returncode} "
+                f"duration_s={attempt_s:.2f} raw_lines={len(raw_lines)} "
                 f"text_len={len(result_text or '')} stderr_len={len(stderr_output or '')}"
             )
+            _se = (stderr_output or "").strip()
+            if _se:
+                _log(
+                    "run_agent_streaming: attempt "
+                    f"{attempt} stderr preview: {_redact_secrets(_se)[:800]}"
+                )
+            elif returncode != 0:
+                _log(
+                    f"run_agent_streaming: attempt {attempt} rc={returncode} "
+                    "with empty stderr"
+                )
 
             tr = _final_transcript().strip()
             rt = (result_text or "").strip()
@@ -1902,7 +1945,6 @@ def run_agent_streaming(
                     current_text = _final_transcript()
                 else:
                     current_text = rt
-                    _stream_parts.clear()
                     _stream_tail = ""
                     _stream_seg = result_text or rt
                 break
@@ -1910,7 +1952,7 @@ def run_agent_streaming(
             if attempt < MAX_RETRIES:
                 delay = min(2 ** attempt, 30)
                 detail = _streaming_empty_summary(returncode, stderr_output, attempt)
-                _stream_parts.clear()
+                _segment_done.clear()
                 _stream_seg = ""
                 _stream_tail = ""
                 _phase_line = (
@@ -1922,7 +1964,7 @@ def run_agent_streaming(
                 continue
 
             current_text = _streaming_empty_summary(returncode, stderr_output, attempt)
-            _stream_parts.clear()
+            _segment_done.clear()
             _stream_seg = ""
             _stream_tail = ""
             _phase_line = current_text
@@ -1979,7 +2021,11 @@ def run_agent_streaming(
             else:
                 rbody = _redact_secrets(rbody)
             (run_dir / "rollout.md").write_text(rbody)
-            _log(f"operator rollout saved ({len(rbody)} chars)")
+            _log(
+                f"operator rollout saved ({len(rbody)} chars) "
+                f"total_elapsed={fmt_duration(_elapsed())} last_rc={last_rc} "
+                f"attempts_used={last_attempt}"
+            )
         except Exception as exc:
             _log(f"operator run artifact save failed: {str(exc)[:120]}")
         _heartbeat_stop.set()
@@ -2062,8 +2108,7 @@ def run_bot():
         _save_chat_id(message.chat.id)
         _reply(
             message,
-            "Use /goal <description> to set a goal and start the loop automatically.\n"
-            "Send /help for all commands.",
+            _truncate_telegram_text(TELEGRAM_HELP_TEXT.strip()),
         )
 
     @bot.message_handler(commands=["help"])
@@ -2115,7 +2160,7 @@ def run_bot():
             lines.append(f"Last step error:\n{gs.last_step_error[:900]}")
         lines.extend([
             "",
-            f"Goal: {goal_text}",
+            f"Loop: {goal_text}",
             "",
             f"State: {state_text}",
             "",
@@ -2207,18 +2252,18 @@ def run_bot():
             except Exception as exc:
                 _log(f"/env: could not delete operator message (token may remain in chat): {exc!r}")
 
-    @bot.message_handler(commands=["goal"])
-    def handle_goal(message):
+    @bot.message_handler(commands=["loop"])
+    def handle_loop(message):
         uid = message.from_user.id if message.from_user else None
         if not _is_owner(uid):
             _reject(message)
             return
         text = (message.text or "").split(None, 1)
         if len(text) < 2 or not text[1].strip():
-            _reply(message, "Usage: /goal <your goal text>")
+            _reply(message, "Usage: /loop GOAL")
             return
         goal_text = text[1].strip()
-        msg = _reply(message, "Setting goal...")
+        msg = _reply(message, "Starting loop...")
         summary = _summarize_goal(goal_text)
         CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
@@ -2236,10 +2281,10 @@ def run_bot():
             _save_agent()
         gs.wake.set()
         bot.edit_message_text(
-            f"Goal set: {summary}\nLoop started (use /pause to pause).",
+            f"Loop set: {summary}\nRunning (use /pause to pause).",
             message.chat.id, msg.message_id,
         )
-        _log(f"goal set ({len(goal_text)} chars), auto-start: {summary}")
+        _log(f"loop set ({len(goal_text)} chars), auto-start: {summary}")
 
     @bot.message_handler(commands=["clear"])
     def handle_clear(message):
@@ -2275,7 +2320,7 @@ def run_bot():
         if RUNS_DIR.exists():
             shutil.rmtree(RUNS_DIR, ignore_errors=True)
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
-        _reply(message, "Goal cleared (GOAL/STATE/INBOX/runs reset). Use /goal to start again.")
+        _reply(message, "Loop cleared (GOAL/STATE/INBOX/runs reset). Use /loop to start again.")
         _log("goal cleared via /clear")
 
     @bot.message_handler(commands=["restart"])
@@ -2662,7 +2707,7 @@ def main() -> None:
 
     _write_claude_settings()
 
-    _send_telegram_text("Arbos Live")
+    _send_telegram_text(_truncate_telegram_text(TELEGRAM_HELP_TEXT.strip()))
 
     threading.Thread(target=_agent_manager, daemon=True).start()
     threading.Thread(target=run_bot, daemon=True).start()

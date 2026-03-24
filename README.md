@@ -31,11 +31,11 @@ curl -fsSL https://raw.githubusercontent.com/unconst/Arbos/main/run.sh | bash
 
 ## Usage
 
-Telegram (after `/start` to register): `/goal <description>` sets `context/GOAL.md` and **starts the loop**. Use `/pause`, `/resume`, `/delay <mins>`, and `/clear` as needed. Send `/help` for the full list.
+Telegram (after `/start` to register): `/loop <description>` sets the current project's `GOAL.md` and **starts the loop**. Use `/pause`, `/resume`, `/delay <mins>`, and `/clear` as needed. Send `/help` for the full list.
 
-Example `/goal` body:
+Example `/loop` body:
 ```
-/goal
+/loop
 
 Use the below program to evolve a system S that discovers profitable trading strategies.
 

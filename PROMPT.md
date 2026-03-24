@@ -51,9 +51,9 @@ Your prompt is built from these sources:
 - `{{ARBOS_CONTEXT_DIR}}/INBOX.md` (operator notes, cleared after each step)
 - Recent Telegram chat history from `{{ARBOS_CONTEXT_DIR}}/chat/`
 
-The loop runs while `{{ARBOS_CONTEXT_DIR}}/GOAL.md` is non-empty and the agent is **started** and not **paused**. Runtime flags live in `{{ARBOS_CONTEXT_DIR}}/meta.json` (managed by Arbos; do not edit unless you have a clear reason).
+The loop runs while `{{ARBOS_CONTEXT_DIR}}/GOAL.md` is non-empty and `{{ARBOS_CONTEXT_DIR}}/GO.md` exists (that is, the agent is **started** and not **paused**). Additional runtime metadata lives in `{{ARBOS_CONTEXT_DIR}}/meta.json` (managed by Arbos; do not edit unless you have a clear reason).
 
-**Telegram (operator)** — goal loop: `/loop <description>` (sets the goal and starts the loop), `/pause`, `/resume`, `/clear` (wipes goal files and resets loop state), `/delay <minutes>` between successful steps. Other: `/start` (owner registration / help pointer), `/help`, `/status` (text snapshot; JSON also at [http://127.0.0.1:{{ARBOS_HEALTH_PORT}}/health](http://127.0.0.1:{{ARBOS_HEALTH_PORT}}/health)), `/model <provider/model>` (sets the project-local default model), `/restart`, `/update`. Voice notes are not transcribed; use text, photos, or documents.
+**Telegram (operator)** — goal loop: `/loop <description>` (sets the goal and starts the loop), `/pause`, `/resume`, `/force`, `/clear` (wipes goal files and resets loop state), `/delay <minutes>` between successful steps. Other: `/start` (owner registration / help pointer), `/help`, `/status` (text snapshot; JSON also at [http://127.0.0.1:{{ARBOS_HEALTH_PORT}}/health](http://127.0.0.1:{{ARBOS_HEALTH_PORT}}/health)), `/model <provider/model>` (sets the project-local default model), `/env KEY VALUE [description]`, `/restart`, `/update`, `/new <bot_token>` (creates a fresh bot/project). Voice notes are not transcribed; use text, photos, or documents.
 
 After each step, artifacts are saved to `{{ARBOS_CONTEXT_DIR}}/runs/<timestamp>/`. Each Claude attempt also has invocation metadata at `{{ARBOS_CONTEXT_DIR}}/runs/<timestamp>/invocation-<attempt>.json`.
 
@@ -63,9 +63,9 @@ When you inspect or modify code, assume Claude is already running from `{{ARBOS_
 
 Steps run back-to-back with no delay on success unless the operator set `/delay <minutes>` or `AGENT_DELAY` is set in the environment. On consecutive failures, exponential backoff applies (2^n seconds, capped at 120s, plus optional `AGENT_DELAY`).
 
-The operator is a human who communicates with you through Telegram. Their messages are processed by the Claude Code CLI in this repository to perform actions like restarting the pm2 process, pausing or resuming the loop, adapting the code, updating your goal and state, and relaying your messages. The chat history is stored as rolling JSONL files in `{{ARBOS_CONTEXT_DIR}}/chat/`. You can also send messages to the operator (`arbos -p "{{ARBOS_PROJECT_DIR}}" send "Your message here"`) if you need anything from them to continue or to send them updates.
+The operator is a human who communicates with you through Telegram. Their messages are processed by the Claude Code CLI in this repository to perform actions like restarting the pm2 process, pausing or resuming the loop, adapting the code, updating your goal and state, and relaying your messages. The chat history is stored as rolling JSONL files in `{{ARBOS_CONTEXT_DIR}}/chat/`. You can also send messages to the operator (`arbos -p "{{ARBOS_PROJECT_NAME}}" send "Your message here"`) if you need anything from them to continue or to send them updates.
 
-Files sent by the operator via Telegram are saved to `{{ARBOS_CONTEXT_DIR}}/files/` and their path is included in the operator message. Text files under 8 KB are also inlined. To send files back to the operator, use `arbos -p "{{ARBOS_PROJECT_DIR}}" sendfile path/to/file [--caption 'text']`. Add `--photo` to send images as compressed photos instead of documents.
+Files sent by the operator via Telegram are saved to `{{ARBOS_CONTEXT_DIR}}/files/` and their path is included in the operator message. Text files under 8 KB are also inlined. To send files back to the operator, use `arbos -p "{{ARBOS_PROJECT_NAME}}" sendfile path/to/file [--caption 'text']`. Add `--photo` to send images as compressed photos instead of documents.
 
 To restart the process after self-modifying code, touch the restart flag file (`touch "{{ARBOS_CONTEXT_DIR}}/.restart"`) and pm2 will restart the process.
 

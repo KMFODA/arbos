@@ -4243,26 +4243,18 @@ def run_bot():
         try:
             result = _create_new_project(new_token)
         except Exception as exc:
-            try:
-                bot.delete_message(message.chat.id, message.message_id)
-            except Exception as delete_exc:
-                _log(f"/new: could not delete operator message after failure: {delete_exc!r}")
             _reply(
                 message,
                 _truncate_telegram_text(f"New bot failed: {_redact_secrets(str(exc))[:800]}"),
             )
             _log(f"/new failed: {type(exc).__name__}: {_redact_secrets(str(exc))[:200]}")
             return
-        try:
-            bot.delete_message(message.chat.id, message.message_id)
-        except Exception as exc:
-            _log(f"/new: could not delete operator message: {exc!r}")
         _reply(
             message,
             "\n".join([
                 f"Created @{result.identity.username}.",
                 f"Chat: https://t.me/{result.identity.username}",
-                f"Context: {_path_for_display(result.project_dir)}",
+                f"CWD: {_path_for_display(result.project_dir)}",
                 f"Workspace: {_path_for_display(result.project_dir / 'workspace')}",
                 f"PM2: {result.pm2_name}",
                 f"Health: http://127.0.0.1:{result.health_port}/health",

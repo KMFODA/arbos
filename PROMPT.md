@@ -37,10 +37,11 @@ For this running instance:
 
 - Project runtime dir: `{{ARBOS_PROJECT_DIR}}`
 - Context/state dir: `{{ARBOS_CONTEXT_DIR}}`
-- Coding workspace cwd: `{{ARBOS_WORKSPACE_DIR}}`
+- Claude subprocess cwd: `{{ARBOS_PROJECT_DIR}}`
+- Coding workspace subdir: `{{ARBOS_WORKSPACE_DIR}}`
 
 Only read and write agent state under `{{ARBOS_CONTEXT_DIR}}/` as above. Do your coding work primarily inside `{{ARBOS_WORKSPACE_DIR}}/`.
-Unless a path is explicitly given as absolute, treat code paths and relative file references as being relative to `{{ARBOS_WORKSPACE_DIR}}/`, because that is the Claude subprocess current working directory.
+Unless a path is explicitly given as absolute, treat relative paths as project-relative to `{{ARBOS_PROJECT_DIR}}/`. In practice, most code work should happen under the `workspace/` subdirectory at `{{ARBOS_WORKSPACE_DIR}}/`.
 
 Your prompt is built from these sources:
 
@@ -58,7 +59,7 @@ After each step, artifacts are saved to `{{ARBOS_CONTEXT_DIR}}/runs/<timestamp>/
 
 Each loop iteration is called a step — a single call to the Claude Code CLI (`claude -p`). You receive the full prompt, think through your approach, and execute — all in one invocation.
 
-When you inspect or modify code, assume Claude is already running from `{{ARBOS_WORKSPACE_DIR}}/`. If you need runtime state, logs, or supervisor files, use explicit paths under `{{ARBOS_CONTEXT_DIR}}/` or `{{ARBOS_ROOT_DIR}}/`.
+When you inspect or modify code, assume Claude is already running from `{{ARBOS_PROJECT_DIR}}/`. If you need code repos, they should usually be under `{{ARBOS_WORKSPACE_DIR}}/`. If you need runtime state, logs, or supervisor files, use explicit paths under `{{ARBOS_CONTEXT_DIR}}/` or `{{ARBOS_ROOT_DIR}}/`.
 
 Steps run back-to-back with no delay on success unless the operator set `/delay <minutes>` or `AGENT_DELAY` is set in the environment. On consecutive failures, exponential backoff applies (2^n seconds, capped at 120s, plus optional `AGENT_DELAY`).
 
@@ -84,7 +85,7 @@ If you need to understand what Claude processes are active right now, inspect `{
 - **Claude invocation metadata**: `{{ARBOS_CONTEXT_DIR}}/invocations.json` is the top-level registry for active/recent Claude runs; per-run metadata lives beside artifacts under `{{ARBOS_CONTEXT_DIR}}/runs/<timestamp>/invocation-<attempt>.json`.
 - **Run artifacts**: Step-specific outputs live in `{{ARBOS_CONTEXT_DIR}}/runs/<timestamp>/`.
 - **Workspace**: Do code edits in `{{ARBOS_WORKSPACE_DIR}}/` unless there is a specific reason to work elsewhere under `{{ARBOS_ROOT_DIR}}/`.
-- **Path handling**: Treat relative code paths as workspace-relative. Use explicit `{{ARBOS_CONTEXT_DIR}}/...` paths when referring to runtime state files.
+- **Path handling**: Treat relative paths as project-relative to `{{ARBOS_PROJECT_DIR}}/`. Use explicit `{{ARBOS_CONTEXT_DIR}}/...` paths when referring to runtime state files.
 - **Shared tools**: Put reusable scripts in `{{ARBOS_CONTEXT_DIR}}/tools/` when they are generally useful.
 - **Background processes**: Use `pm2` for long-lived processes and leave enough breadcrumbs in `STATE.md` for the next step.
 - **Be proactive**: Work in stages, keep notes for your future self, and keep moving toward the goal.

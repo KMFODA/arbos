@@ -875,7 +875,7 @@ _ARBOS_ENV_BUILTIN_DOC: dict[str, str] = {
     "ANTHROPIC_AUTH_TOKEN": "Optional auth token for the API (cleared when using OpenRouter).",
     "ANTHROPIC_BASE_URL": "Anthropic-compatible API base URL (OpenRouter).",
     "ARBOS_HEALTH_PORT": "Local HTTP /health port for this Arbos process.",
-    "ARBOS_WORKSPACE_DIR": "Project workspace directory used as the coding agent subprocess cwd.",
+    "ARBOS_WORKSPACE_DIR": "Project workspace subdirectory for checked-out repos and coding work.",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "Claude Code setting to reduce background traffic.",
     "CLAUDE_MAX_RETRIES": "Retries when a Claude run fails.",
     "CLAUDE_MODEL": "Model id for Claude Code (e.g. anthropic/claude-opus-4.6).",
@@ -1872,7 +1872,7 @@ def _run_claude_once(
     on a full PIPE buffer.
     """
     proc = subprocess.Popen(
-        cmd, cwd=WORKSPACE_DIR, env=env,
+        cmd, cwd=PROJECT_DIR, env=env,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, bufsize=1,

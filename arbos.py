@@ -12,6 +12,7 @@ from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Any
+from uuid import uuid4
 
 import hashlib
 import re
@@ -32,6 +33,7 @@ STATE_FILE = CONTEXT_DIR / "STATE.md"
 INBOX_FILE = CONTEXT_DIR / "INBOX.md"
 RUNS_DIR = CONTEXT_DIR / "runs"
 META_FILE = CONTEXT_DIR / "meta.json"
+CLAUDE_INVOCATIONS_FILE = CONTEXT_DIR / "claude_invocations.json"
 STEP_MSG_FILE = CONTEXT_DIR / ".step_msg"
 CONTEXT_LOGS_DIR = CONTEXT_DIR / "logs"
 CHATLOG_DIR = CONTEXT_DIR / "chat"
@@ -41,6 +43,9 @@ CHAT_ID_FILE = WORKING_DIR / "chat_id.txt"
 # Forum supergroup topic for operator + goal-loop bubbles (same thread as streaming /operator replies).
 OPERATOR_THREAD_ID_FILE = WORKING_DIR / "operator_thread_id.txt"
 ENV_ENC_FILE = WORKING_DIR / ".env.enc"
+ARBOS_STEP_STREAM_ID_ENV = "ARBOS_STEP_STREAM_ID"
+STATE_AUTOSYNC_START = "<!-- ARBOS_STATE_AUTOSYNC_START -->"
+STATE_AUTOSYNC_END = "<!-- ARBOS_STATE_AUTOSYNC_END -->"
 
 # ── Encrypted .env ───────────────────────────────────────────────────────────
 
@@ -340,11 +345,51 @@ def _persist_env_var_with_comment(key: str, value: str, description: str) -> tup
 
 _shutdown = threading.Event()
 _step_count = 0
-# Approximate size of the prompt Arbos passes into the agent (request scale for OpenRouter).
+# Header usage state for the current Claude rollout.
 _context_est_tokens = 0
+_context_paid_usage = None
+_context_attempt_inflight = False
 _context_lock = threading.Lock()
 _child_procs: set[subprocess.Popen] = set()
 _child_procs_lock = threading.Lock()
+_claude_invocations: dict[str, dict[str, Any]] = {}
+_claude_invocations_lock = threading.Lock()
+
+
+@dataclass
+class ClaudeUsage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
+
+    @property
+    def total_input_tokens(self) -> int:
+        return max(
+            0,
+            self.input_tokens
+            + self.cache_creation_input_tokens
+            + self.cache_read_input_tokens,
+        )
+
+    def plus(self, other: "ClaudeUsage | None") -> "ClaudeUsage":
+        if other is None:
+            return ClaudeUsage(
+                input_tokens=self.input_tokens,
+                output_tokens=self.output_tokens,
+                cache_creation_input_tokens=self.cache_creation_input_tokens,
+                cache_read_input_tokens=self.cache_read_input_tokens,
+            )
+        return ClaudeUsage(
+            input_tokens=self.input_tokens + other.input_tokens,
+            output_tokens=self.output_tokens + other.output_tokens,
+            cache_creation_input_tokens=(
+                self.cache_creation_input_tokens + other.cache_creation_input_tokens
+            ),
+            cache_read_input_tokens=(
+                self.cache_read_input_tokens + other.cache_read_input_tokens
+            ),
+        )
 
 
 # ── Single-agent state ───────────────────────────────────────────────────────
@@ -439,6 +484,12 @@ def _operator_health_payload() -> dict[str, Any]:
             else (gs.last_step_error or None),
             "summary": gs.summary or None,
         }
+    invocations = _claude_invocation_items()
+    out["claude_invocations"] = {
+        "running_count": sum(1 for item in invocations if item.get("status") == "running"),
+        "items": invocations[:20],
+        "registry_path": _path_for_metadata(CLAUDE_INVOCATIONS_FILE),
+    }
     if not LLM_API_KEY:
         out["status"] = "degraded"
         out["degraded_reason"] = "OPENROUTER_API_KEY not set — LLM calls will fail"
@@ -577,32 +628,106 @@ def _approx_prompt_context_tokens(prompt: str) -> int:
     return max(1, (n + 3) // 4)
 
 
-def _set_prompt_context_estimate(prompt: str) -> None:
-    global _context_est_tokens
+def _reset_prompt_context_usage(prompt: str) -> None:
+    global _context_est_tokens, _context_paid_usage, _context_attempt_inflight
     with _context_lock:
         _context_est_tokens = _approx_prompt_context_tokens(prompt)
+        _context_paid_usage = ClaudeUsage()
+        _context_attempt_inflight = True
 
 
-def _fmt_context_for_header(est: int) -> str:
-    if est <= 0:
-        return "~0 ctx"
-    if est >= 1000:
-        return f"~{est / 1000:.1f}k ctx"
-    return f"~{est} ctx"
+def _mark_prompt_context_attempt_started(prompt_est_tokens: int | None = None) -> None:
+    global _context_est_tokens, _context_attempt_inflight
+    with _context_lock:
+        if prompt_est_tokens is not None and prompt_est_tokens > 0:
+            _context_est_tokens = prompt_est_tokens
+        _context_attempt_inflight = True
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _parse_result_usage(raw_lines: list[str]) -> ClaudeUsage | None:
+    for line in reversed(raw_lines):
+        try:
+            evt = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if evt.get("type") != "result":
+            continue
+        usage = evt.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        return ClaudeUsage(
+            input_tokens=_safe_int(usage.get("input_tokens")),
+            output_tokens=_safe_int(usage.get("output_tokens")),
+            cache_creation_input_tokens=_safe_int(
+                usage.get("cache_creation_input_tokens")
+            ),
+            cache_read_input_tokens=_safe_int(usage.get("cache_read_input_tokens")),
+        )
+    return None
+
+
+def _record_prompt_context_usage(usage: ClaudeUsage | None) -> ClaudeUsage:
+    global _context_paid_usage, _context_attempt_inflight
+    with _context_lock:
+        paid = _context_paid_usage or ClaudeUsage()
+        if usage is not None:
+            paid = paid.plus(usage)
+            _context_paid_usage = paid
+        _context_attempt_inflight = False
+        return paid
+
+
+def _fmt_token_count(count: int) -> str:
+    if count < 1000:
+        return str(count)
+    return f"{count / 1000:.1f}k"
+
+
+def _fmt_context_for_header(
+    est: int,
+    paid_usage: ClaudeUsage | None,
+    attempt_inflight: bool,
+) -> str:
+    paid_usage = paid_usage or ClaudeUsage()
+    paid_in = _fmt_token_count(paid_usage.total_input_tokens)
+    if attempt_inflight and est > 0:
+        return f"paid {paid_in} in (+ est {_fmt_token_count(est)} current)"
+    if paid_usage.total_input_tokens > 0 or paid_usage.output_tokens > 0:
+        return f"paid {paid_in} in, {_fmt_token_count(paid_usage.output_tokens)} out"
+    if est > 0:
+        return f"paid {paid_in} in (+ est {_fmt_token_count(est)} current)"
+    return "usage pending"
 
 
 def _arbos_response_header(elapsed_s: float) -> str:
-    """First line on Telegram: elapsed + estimated request context (our prompt to the agent)."""
+    """First line on Telegram: elapsed + estimated or actual Claude/OpenRouter usage."""
     with _context_lock:
         est = _context_est_tokens
-    return f"Arbos ( {fmt_duration(elapsed_s)}, {_fmt_context_for_header(est)} )"
+        paid = _context_paid_usage
+        attempt_inflight = _context_attempt_inflight
+    return (
+        f"Arbos ( {fmt_duration(elapsed_s)}, "
+        f"{_fmt_context_for_header(est, paid, attempt_inflight)} )"
+    )
 
 
-def _step_response_header(elapsed_s: float) -> str:
-    """First line on step bubbles: same timing/ctx as Arbos replies, prefixed with Step."""
+def _step_response_header(elapsed_s: float, step_label: str = "Step") -> str:
+    """First line on step bubbles: step label + elapsed + estimated/actual usage."""
     with _context_lock:
         est = _context_est_tokens
-    return f"Step ( {fmt_duration(elapsed_s)}, {_fmt_context_for_header(est)} )"
+        paid = _context_paid_usage
+        attempt_inflight = _context_attempt_inflight
+    return (
+        f"{step_label} ( {fmt_duration(elapsed_s)}, "
+        f"{_fmt_context_for_header(est, paid, attempt_inflight)} )"
+    )
 
 
 # ── Prompt helpers ───────────────────────────────────────────────────────────
@@ -771,7 +896,8 @@ def load_prompt(consume_inbox: bool = False, agent_step: int = 0) -> str:
             parts.append(
                 f"{header}\n\n{goal_text}\n\n"
                 "Your context files are under context/: STATE.md, INBOX.md, runs/, "
-                "chat/, files/, tools/, workspace/ (see PROMPT.md)."
+                "chat/, files/, tools/, workspace/, and claude_invocations.json "
+                "(see PROMPT.md)."
             )
     if STATE_FILE.exists():
         state_text = STATE_FILE.read_text().strip()
@@ -786,6 +912,7 @@ def load_prompt(consume_inbox: bool = False, agent_step: int = 0) -> str:
     chatlog = load_chatlog()
     if chatlog:
         parts.append(chatlog)
+    parts.append(_claude_invocations_prompt_section())
     return "\n\n".join(parts)
 
 
@@ -796,6 +923,234 @@ def make_run_dir() -> Path:
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
 
+
+def _utc_now_iso() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _path_for_metadata(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    try:
+        return str(path.relative_to(WORKING_DIR))
+    except ValueError:
+        return str(path)
+
+
+def _usage_to_dict(usage: ClaudeUsage | None) -> dict[str, int] | None:
+    if usage is None:
+        return None
+    return {
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+        "cache_read_input_tokens": usage.cache_read_input_tokens,
+        "total_input_tokens": usage.total_input_tokens,
+    }
+
+
+def _summarize_claude_cmd(cmd: list[str]) -> list[str]:
+    out: list[str] = []
+    skip_prompt = False
+    for i, part in enumerate(cmd):
+        if skip_prompt:
+            skip_prompt = False
+            continue
+        if part == "-p" and i + 1 < len(cmd):
+            out.extend(["-p", "<prompt elided>"])
+            skip_prompt = True
+            continue
+        out.append(part if len(part) <= 120 else part[:117] + "...")
+    return out
+
+
+def _invocation_snapshot_entry(meta: dict[str, Any], *, now: float | None = None) -> dict[str, Any]:
+    now = time.time() if now is None else now
+    item = {
+        k: v
+        for k, v in meta.items()
+        if not k.startswith("_")
+    }
+    started_wall = float(meta.get("_started_wall", 0.0) or 0.0)
+    finished_wall = meta.get("_finished_wall")
+    if finished_wall is None:
+        item["uptime_seconds"] = max(0, int(now - started_wall)) if started_wall else None
+    else:
+        item["duration_seconds"] = max(0, int(float(finished_wall) - started_wall))
+    return item
+
+
+def _persist_claude_invocations_locked() -> None:
+    now = time.time()
+    items = [
+        _invocation_snapshot_entry(meta, now=now)
+        for meta in _claude_invocations.values()
+    ]
+    items.sort(
+        key=lambda item: (
+            item.get("status") != "running",
+            -(item.get("pid") or 0),
+            item.get("started_at") or "",
+        )
+    )
+    payload = {
+        "updated_at": _utc_now_iso(),
+        "arbos_pid": os.getpid(),
+        "running_count": sum(1 for item in items if item.get("status") == "running"),
+        "items": items[:100],
+    }
+    CLAUDE_INVOCATIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CLAUDE_INVOCATIONS_FILE.write_text(json.dumps(payload, indent=2))
+
+
+def _persist_run_invocation_meta(meta: dict[str, Any]) -> None:
+    run_dir_str = meta.get("run_dir")
+    if not run_dir_str:
+        return
+    run_dir = WORKING_DIR / run_dir_str
+    run_dir.mkdir(parents=True, exist_ok=True)
+    attempt = int(meta.get("attempt") or 0)
+    file_name = f"invocation-{attempt}.json" if attempt > 0 else "invocation.json"
+    path = run_dir / file_name
+    path.write_text(json.dumps(_invocation_snapshot_entry(meta), indent=2))
+
+
+def _register_claude_invocation(
+    proc: subprocess.Popen,
+    *,
+    kind: str,
+    phase: str,
+    run_dir: Path | None,
+    attempt: int,
+    cmd: list[str],
+    prompt_est_tokens: int = 0,
+    step_label: str | None = None,
+) -> str:
+    invocation_id = uuid4().hex[:12]
+    now_wall = time.time()
+    meta: dict[str, Any] = {
+        "invocation_id": invocation_id,
+        "status": "running",
+        "kind": kind,
+        "phase": phase,
+        "step_label": step_label,
+        "attempt": attempt,
+        "pid": proc.pid,
+        "arbos_pid": os.getpid(),
+        "started_at": _utc_now_iso(),
+        "finished_at": None,
+        "last_error": None,
+        "returncode": None,
+        "run_dir": _path_for_metadata(run_dir),
+        "log_path": _path_for_metadata(run_dir / "logs.txt") if run_dir else None,
+        "output_path": _path_for_metadata(run_dir / "output.txt") if run_dir else None,
+        "rollout_path": _path_for_metadata(run_dir / "rollout.md") if run_dir else None,
+        "prompt_est_tokens": prompt_est_tokens,
+        "usage": None,
+        "command": _summarize_claude_cmd(cmd),
+        "_started_wall": now_wall,
+        "_finished_wall": None,
+    }
+    with _claude_invocations_lock:
+        _claude_invocations[invocation_id] = meta
+        _persist_claude_invocations_locked()
+    _persist_run_invocation_meta(meta)
+    return invocation_id
+
+
+def _finalize_claude_invocation(
+    invocation_id: str | None,
+    *,
+    returncode: int,
+    stderr_output: str,
+    usage: ClaudeUsage | None,
+    status: str | None = None,
+) -> None:
+    if not invocation_id:
+        return
+    with _claude_invocations_lock:
+        meta = _claude_invocations.get(invocation_id)
+        if not meta:
+            return
+        meta["status"] = status or ("done" if returncode == 0 else "failed")
+        meta["returncode"] = returncode
+        meta["finished_at"] = _utc_now_iso()
+        meta["usage"] = _usage_to_dict(usage)
+        meta["last_error"] = (stderr_output or "").strip()[:800] or None
+        meta["_finished_wall"] = time.time()
+        _persist_claude_invocations_locked()
+        snapshot = dict(meta)
+    _persist_run_invocation_meta(snapshot)
+
+
+def _mark_claude_invocation_pid_status(pid: int, *, status: str, detail: str | None = None) -> None:
+    if not pid:
+        return
+    with _claude_invocations_lock:
+        changed = False
+        for meta in _claude_invocations.values():
+            if meta.get("pid") != pid or meta.get("status") != "running":
+                continue
+            meta["status"] = status
+            meta["finished_at"] = _utc_now_iso()
+            meta["last_error"] = detail[:800] if detail else meta.get("last_error")
+            meta["_finished_wall"] = time.time()
+            changed = True
+            _persist_run_invocation_meta(meta)
+        if changed:
+            _persist_claude_invocations_locked()
+
+
+def _claude_invocation_items(*, include_finished: bool = True) -> list[dict[str, Any]]:
+    now = time.time()
+    with _claude_invocations_lock:
+        items = [
+            _invocation_snapshot_entry(meta, now=now)
+            for meta in _claude_invocations.values()
+            if include_finished or meta.get("status") == "running"
+        ]
+    items.sort(key=lambda item: item.get("started_at") or "", reverse=True)
+    items.sort(key=lambda item: item.get("status") != "running")
+    return items
+
+
+def _reset_claude_invocations() -> None:
+    with _claude_invocations_lock:
+        _claude_invocations.clear()
+        _persist_claude_invocations_locked()
+
+
+def _claude_invocations_prompt_section(limit: int = 8) -> str:
+    items = _claude_invocation_items()
+    if not items:
+        return (
+            "## Claude invocations\n\n"
+            "Registry: `context/claude_invocations.json`\n"
+            "Per-run metadata: `context/runs/<timestamp>/invocation-<attempt>.json`\n"
+            "No Claude invocations have been recorded in this process yet."
+        )
+    lines = [
+        "## Claude invocations",
+        "",
+        "Registry: `context/claude_invocations.json`",
+        "Per-run metadata: `context/runs/<timestamp>/invocation-<attempt>.json`",
+        "Use the `pid` there if you need to inspect or kill a stuck Claude subprocess.",
+        "",
+    ]
+    for item in items[:limit]:
+        status = item.get("status") or "unknown"
+        label = item.get("step_label") or item.get("phase") or item.get("kind") or "claude"
+        pid = item.get("pid") or "?"
+        age = item.get("uptime_seconds")
+        if age is None:
+            age = item.get("duration_seconds")
+        run_dir = item.get("run_dir") or "(none)"
+        lines.append(
+            f"- `{label}` [{status}] pid={pid} age={age}s run_dir=`{run_dir}`"
+        )
+    if len(items) > limit:
+        lines.append(f"- … and {len(items) - limit} more invocation(s).")
+    return "\n".join(lines)
 
 def log_chat(role: str, text: str):
     """Append to chatlog, rolling to a new file when size exceeds limit."""
@@ -913,6 +1268,32 @@ def _truncate_telegram_text(text: str, limit: int = TELEGRAM_SAFE_TEXT) -> str:
         return text
     notice = f"\n\n… [truncated, {len(text)} chars total]"
     return text[: max(0, limit - len(notice))] + notice
+
+
+def _tail_text_for_telegram(text: str, limit: int) -> str:
+    """Keep the most recent text within *limit*, dropping older rollout lines first."""
+    text = (text or "").strip()
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    ellipsis = "…\n"
+    body_limit = max(0, limit - len(ellipsis))
+    lines = text.splitlines()
+    kept: list[str] = []
+    total = 0
+    for line in reversed(lines):
+        add = len(line) + (1 if kept else 0)
+        if kept and total + add > body_limit:
+            break
+        if (not kept) and len(line) > body_limit:
+            kept = [line[-body_limit:]] if body_limit > 0 else []
+            total = len(kept[0]) if kept else 0
+            break
+        kept.append(line)
+        total += add
+    kept.reverse()
+    return ellipsis + "\n".join(kept)
 
 
 def _telegram_send_message_fallback(
@@ -1292,8 +1673,15 @@ def _prefer_richer_assistant_text(
     return r if r else longest
 
 
-def _run_claude_once(cmd, env, on_text=None, on_activity=None):
-    """Run a single claude subprocess, return (returncode, result_text, raw_lines, stderr).
+def _run_claude_once(
+    cmd,
+    env,
+    on_text=None,
+    on_activity=None,
+    *,
+    invocation_meta: dict[str, Any] | None = None,
+):
+    """Run a single claude subprocess, return (returncode, result_text, raw_lines, stderr, usage).
 
     on_text: optional callback(accumulated_text) fired as assistant text streams in.
     on_activity: optional callback(status_str) fired on tool use and other activity.
@@ -1310,6 +1698,9 @@ def _run_claude_once(cmd, env, on_text=None, on_activity=None):
     )
     with _child_procs_lock:
         _child_procs.add(proc)
+    invocation_id = None
+    if invocation_meta is not None:
+        invocation_id = _register_claude_invocation(proc, cmd=cmd, **invocation_meta)
 
     result_text = ""
     complete_texts: list[str] = []
@@ -1367,6 +1758,11 @@ def _run_claude_once(cmd, env, on_text=None, on_activity=None):
                     _log(
                         f"claude timeout: no stdout/stderr activity for {CLAUDE_TIMEOUT}s, "
                         f"killing pid={proc.pid}"
+                    )
+                    _mark_claude_invocation_pid_status(
+                        proc.pid,
+                        status="timed_out",
+                        detail=f"timed out after {CLAUDE_TIMEOUT}s idle",
                     )
                     proc.kill()
                     timed_out = True
@@ -1440,27 +1836,73 @@ def _run_claude_once(cmd, env, on_text=None, on_activity=None):
     returncode = proc.wait()
     with _child_procs_lock:
         _child_procs.discard(proc)
-    return returncode, result_text, raw_lines, stderr_output
+    usage = _parse_result_usage(raw_lines)
+    _finalize_claude_invocation(
+        invocation_id,
+        returncode=returncode,
+        stderr_output=stderr_output,
+        usage=usage,
+        status="timed_out" if timed_out else None,
+    )
+    return returncode, result_text, raw_lines, stderr_output, usage
 
 
-def run_agent(cmd: list[str], phase: str, output_file: Path,
-              on_text=None, on_activity=None) -> subprocess.CompletedProcess:
+def run_agent(
+    cmd: list[str],
+    phase: str,
+    output_file: Path,
+    *,
+    run_dir: Path | None = None,
+    invocation_kind: str = "loop_step",
+    step_label: str | None = None,
+    prompt_est_tokens: int = 0,
+    extra_env: dict[str, str] | None = None,
+    on_text=None,
+    on_activity=None,
+) -> subprocess.CompletedProcess:
     env = _claude_env()
+    if extra_env:
+        env.update(extra_env)
     flags = " ".join(a for a in cmd if a.startswith("-"))
 
     returncode, result_text, raw_lines, stderr_output = 1, "", [], "no attempts made"
 
     for attempt in range(1, MAX_RETRIES + 1):
         _log(f"{phase}: starting (attempt={attempt}) flags=[{flags}]")
+        _mark_prompt_context_attempt_started(prompt_est_tokens)
         t0 = time.monotonic()
 
-        returncode, result_text, raw_lines, stderr_output = _run_claude_once(
-            cmd, env, on_text=on_text, on_activity=on_activity,
+        returncode, result_text, raw_lines, stderr_output, usage = _run_claude_once(
+            cmd,
+            env,
+            on_text=on_text,
+            on_activity=on_activity,
+            invocation_meta={
+                "kind": invocation_kind,
+                "phase": phase,
+                "run_dir": run_dir,
+                "attempt": attempt,
+                "prompt_est_tokens": prompt_est_tokens,
+                "step_label": step_label,
+            },
         )
+        paid_usage = _record_prompt_context_usage(usage)
         elapsed = time.monotonic() - t0
 
         output_file.write_text(_redact_secrets("".join(raw_lines)))
         _log(f"{phase}: finished rc={returncode} {fmt_duration(elapsed)}")
+        if usage is not None:
+            _log(
+                f"{phase}: usage in={usage.total_input_tokens} "
+                f"(direct={usage.input_tokens} "
+                f"cache_write={usage.cache_creation_input_tokens} "
+                f"cache_read={usage.cache_read_input_tokens}) "
+                f"out={usage.output_tokens}"
+            )
+            _log(
+                f"{phase}: rollout paid total in={paid_usage.total_input_tokens} "
+                f"out={paid_usage.output_tokens}"
+            )
 
         if returncode != 0:
             if stderr_output.strip():
@@ -1498,6 +1940,70 @@ def extract_text(result: subprocess.CompletedProcess) -> str:
     )
 
 
+def _strip_state_autosync_block(text: str) -> str:
+    """Remove the host-managed STATE.md footer while preserving agent notes."""
+    raw = text or ""
+    start = raw.find(STATE_AUTOSYNC_START)
+    if start < 0:
+        return raw.strip()
+    end = raw.find(STATE_AUTOSYNC_END, start)
+    if end < 0:
+        return raw[:start].strip()
+    end += len(STATE_AUTOSYNC_END)
+    return (raw[:start] + raw[end:]).strip()
+
+
+def _state_sync_summary_line(text: str, *, max_chars: int = 220) -> str:
+    """Pick a compact, single-line summary from agent output."""
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("```"):
+            continue
+        line = re.sub(r"^#+\s+", "", line)
+        line = re.sub(r"^[-*+]\s+", "", line)
+        line = re.sub(r"^\d+[.)]\s+", "", line)
+        line = re.sub(r"\s+", " ", line).strip()
+        if not line:
+            continue
+        if len(line) > max_chars:
+            return line[: max_chars - 1].rstrip() + "…"
+        return line
+    return ""
+
+
+def _sync_state_after_step(
+    *,
+    step_label: str,
+    success: bool,
+    elapsed_s: float,
+    rollout_text: str,
+    failure_detail: str,
+) -> str:
+    """Keep STATE.md fresh even if the agent forgets to update it."""
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    existing_text = STATE_FILE.read_text() if STATE_FILE.exists() else ""
+    preserved_text = _strip_state_autosync_block(existing_text)
+    summary = _state_sync_summary_line(
+        rollout_text if rollout_text.strip() else failure_detail
+    )
+    if not summary and failure_detail.strip():
+        summary = _state_sync_summary_line(failure_detail)
+
+    host_lines = [
+        STATE_AUTOSYNC_START,
+        f"Host sync: {_utc_now_iso()}",
+        f"Last step: {step_label} [{'ok' if success else 'failed'}] ({fmt_duration(elapsed_s)})",
+    ]
+    if summary:
+        host_lines.append(f"Summary: {summary}")
+    host_lines.append(STATE_AUTOSYNC_END)
+
+    host_block = "\n".join(host_lines)
+    new_text = f"{preserved_text}\n\n{host_block}".strip() + "\n"
+    STATE_FILE.write_text(new_text)
+    return new_text.strip()
+
+
 def _format_step_live_bubble(
     elapsed_s: float,
     step_label: str,
@@ -1506,23 +2012,21 @@ def _format_step_live_bubble(
     *,
     placeholder: str | None = None,
 ) -> str:
-    """Single Telegram bubble while a loop step runs: header, step id line, optional tool line, rollout."""
-    lines = [
-        _step_response_header(elapsed_s),
-        "",
-        f"{step_label} (running)",
-    ]
+    """Single Telegram bubble while a loop step runs: header, optional tool line, rolling rollout tail."""
+    header = _step_response_header(elapsed_s, step_label)
+    lines = [header]
     ts = (tool_or_status or "").strip()
-    if ts and ts not in ("working...",):
+    if ts and ts not in ("working ...",):
         lines.append(ts)
-    lines.append("")
-    if rollout.strip():
-        lines.append(rollout.strip())
-    elif placeholder:
-        lines.append(placeholder)
-    else:
-        lines.append("(waiting for assistant text…)")
-    return "\n".join(lines)
+    prefix = "\n".join(lines)
+    body = rollout.strip()
+    if not body:
+        body = placeholder or "(waiting for assistant text…)"
+    available = TELEGRAM_SAFE_TEXT - len(prefix) - 2
+    body = _tail_text_for_telegram(body, max(0, available))
+    if body:
+        return f"{prefix}\n{body}"
+    return prefix
 
 
 def _pre_send_normal_step_bubble(agent_step: int, global_step: int) -> int | None:
@@ -1553,7 +2057,7 @@ def run_step(
 ) -> tuple[bool, str]:
     run_dir: Path | None = None
     t0 = time.monotonic()
-    _set_prompt_context_estimate(prompt)
+    _reset_prompt_context_usage(prompt)
 
     smf = STEP_MSG_FILE
     use_step_msg_file = not force_step
@@ -1568,23 +2072,28 @@ def run_step(
     step_msg_id: int | None = None
     step_msg_text = ""
     last_edit = 0.0
+    step_stream_id = uuid4().hex[:12]
 
     _step_initial_text = _format_step_live_bubble(
         0.0, step_label, "", "", placeholder="(starting…)",
     )
     if existing_step_msg_id is not None and not force_step:
         step_msg_id = existing_step_msg_id
-        if use_step_msg_file and not smf.exists():
+        if use_step_msg_file:
             smf.parent.mkdir(parents=True, exist_ok=True)
             smf.write_text(json.dumps({
-                "msg_id": step_msg_id, "text": _step_initial_text,
+                "msg_id": step_msg_id,
+                "text": _step_initial_text,
+                "stream_id": step_stream_id,
             }))
     elif target:
         step_msg_id = _send_telegram_new(_step_initial_text, target=target)
         if step_msg_id and use_step_msg_file:
             smf.parent.mkdir(parents=True, exist_ok=True)
             smf.write_text(json.dumps({
-                "msg_id": step_msg_id, "text": _step_initial_text,
+                "msg_id": step_msg_id,
+                "text": _step_initial_text,
+                "stream_id": step_stream_id,
             }))
     else:
         smf.unlink(missing_ok=True)
@@ -1596,7 +2105,11 @@ def run_step(
         if not mid:
             return
         smf.parent.mkdir(parents=True, exist_ok=True)
-        smf.write_text(json.dumps({"msg_id": mid, "text": text}))
+        smf.write_text(json.dumps({
+            "msg_id": mid,
+            "text": text,
+            "stream_id": step_stream_id,
+        }))
 
     def _edit_step_msg(
         text: str,
@@ -1661,12 +2174,12 @@ def run_step(
         while not _heartbeat_stop.wait(timeout=3.0):
             _operator_tick()
             elapsed_s = time.monotonic() - t0
-            status = _last_activity[0] or "working..."
+            status = _last_activity[0] or "working ..."
             bubble = _format_step_live_bubble(
                 elapsed_s,
                 step_label,
                 _redact_secrets(_rollout_buf[0]),
-                status if status != "working..." else "",
+                status if status != "working ..." else "",
             )
             _edit_step_msg(bubble, force=True)
 
@@ -1700,6 +2213,11 @@ def run_step(
                 _claude_cmd(prompt),
                 phase="agent_step",
                 output_file=run_dir / "output.txt",
+                run_dir=run_dir,
+                invocation_kind="loop_step",
+                step_label=step_label,
+                prompt_est_tokens=_approx_prompt_context_tokens(prompt),
+                extra_env={ARBOS_STEP_STREAM_ID_ENV: step_stream_id},
                 on_text=_on_text,
                 on_activity=_on_activity,
             )
@@ -1736,7 +2254,6 @@ def run_step(
                 rollout = (run_dir / "rollout.md").read_text()
             status = "done" if success else "failed"
             goal_text = GOAL_FILE.read_text().strip() if GOAL_FILE.exists() else ""
-            state_text = STATE_FILE.read_text().strip() if STATE_FILE.exists() else ""
             inbox_text = INBOX_FILE.read_text().strip() if INBOX_FILE.exists() else ""
             go_text = GO_FLAG_FILE.read_text().strip() if GO_FLAG_FILE.exists() else ""
 
@@ -1755,7 +2272,7 @@ def run_step(
                     pass
 
             elapsed_s = time.monotonic() - t0
-            hdr = _step_response_header(elapsed_s)
+            hdr = _step_response_header(elapsed_s, step_label)
             if not success and result is not None:
                 hdr = f"{hdr} — FAILED (exit {result.returncode})"
             else:
@@ -1772,7 +2289,14 @@ def run_step(
             failure_detail = (
                 _redact_secrets(_build_agent_failure_detail(result))
                 if (not success and result is not None)
-                else ""
+                else (failure_summary or "")
+            )
+            state_text = _sync_state_after_step(
+                step_label=step_label,
+                success=success,
+                elapsed_s=elapsed_s,
+                rollout_text=rollout,
+                failure_detail=failure_detail,
             )
             summary = _summarize_step_outcome(
                 step_label=step_label,
@@ -2246,6 +2770,8 @@ def _build_operator_prompt(user_text: str, *, reply_context: str | None = None) 
         "- **Set system prompt**: write to `PROMPT.md`.\n"
         "- **Set env variable**: write `KEY='VALUE'` lines (one per line) to `context/.env.pending`. They are picked up automatically and persisted.\n"
         "- **View logs**: read files in `context/runs/<timestamp>/` (rollout.md, logs.txt).\n"
+        "- **Inspect Claude invocations**: read `context/claude_invocations.json` for active/recent subprocess metadata, and `context/runs/<timestamp>/invocation-<attempt>.json` for per-run details.\n"
+        "- **Kill a stuck Claude run**: use the `pid` from the invocation metadata and terminate that specific subprocess.\n"
         "- **Modify code & restart**: edit code files, then run `touch .restart`.\n"
         "- **Send follow-up**: run `python arbos.py send \"your text here\"`.\n"
         "- **Send file to operator**: run `python arbos.py sendfile path/to/file [--caption 'text'] [--photo]`.\n"
@@ -2272,6 +2798,7 @@ def _build_operator_prompt(user_text: str, *, reply_context: str | None = None) 
     context = _recent_context(max_chars=4000)
     if context:
         parts.append(f"## Recent activity\n{context}")
+    parts.append(_claude_invocations_prompt_section(limit=6))
     if reply_context:
         parts.append(reply_context)
     parts.append(f"## Operator message\n{user_text}")
@@ -2314,7 +2841,7 @@ def _format_tool_activity(tool_name: str, tool_input: dict) -> str:
         detail = (tool_input.get("description") or "")[:60]
     if detail:
         return f"{label}: {detail}"
-    return f"{label}..."
+    return f"{label} ..."
 
 
 def run_agent_streaming(
@@ -2343,7 +2870,7 @@ def run_agent_streaming(
     cmd = _claude_cmd(prompt)
 
     t0 = time.monotonic()
-    _set_prompt_context_estimate(prompt)
+    _reset_prompt_context_usage(prompt)
 
     def _elapsed() -> float:
         return time.monotonic() - t0
@@ -2537,12 +3064,25 @@ def run_agent_streaming(
             _phase_line = "Thinking ..."
             _paint(force=True)
             _log(f"run_agent_streaming: attempt {attempt}/{MAX_RETRIES} starting")
+            _mark_prompt_context_attempt_started(_approx_prompt_context_tokens(prompt))
             t_attempt = time.monotonic()
 
-            returncode, result_text, raw_lines, stderr_output = _run_claude_once(
-                cmd, env, on_text=_on_text, on_activity=_on_activity,
+            returncode, result_text, raw_lines, stderr_output, usage = _run_claude_once(
+                cmd,
+                env,
+                on_text=_on_text,
+                on_activity=_on_activity,
+                invocation_meta={
+                    "kind": "operator_chat",
+                    "phase": "operator_chat",
+                    "run_dir": run_dir,
+                    "attempt": attempt,
+                    "prompt_est_tokens": _approx_prompt_context_tokens(prompt),
+                    "step_label": "operator chat",
+                },
             )
             last_raw_lines = raw_lines
+            paid_usage = _record_prompt_context_usage(usage)
             last_rc, last_stderr = returncode, stderr_output
             attempt_s = time.monotonic() - t_attempt
 
@@ -2551,6 +3091,19 @@ def run_agent_streaming(
                 f"duration_s={attempt_s:.2f} raw_lines={len(raw_lines)} "
                 f"text_len={len(result_text or '')} stderr_len={len(stderr_output or '')}"
             )
+            if usage is not None:
+                _log(
+                    "run_agent_streaming: usage "
+                    f"in={usage.total_input_tokens} "
+                    f"(direct={usage.input_tokens} "
+                    f"cache_write={usage.cache_creation_input_tokens} "
+                    f"cache_read={usage.cache_read_input_tokens}) "
+                    f"out={usage.output_tokens}"
+                )
+                _log(
+                    "run_agent_streaming: rollout paid total "
+                    f"in={paid_usage.total_input_tokens} out={paid_usage.output_tokens}"
+                )
             _se = (stderr_output or "").strip()
             if _se:
                 _log(
@@ -2806,8 +3359,21 @@ def run_bot():
             f"State: {state_text}",
             "",
             f"Total steps: {_step_count}",
+            f"Claude registry: {CLAUDE_INVOCATIONS_FILE}",
             f"HTTP GET http://127.0.0.1:{HEALTH_PORT}/health for JSON.",
         ])
+        invocation_items = hp.get("claude_invocations", {}).get("items", [])
+        if invocation_items:
+            lines.extend(["", "Claude invocations:"])
+            for item in invocation_items[:6]:
+                age = item.get("uptime_seconds")
+                if age is None:
+                    age = item.get("duration_seconds")
+                lines.append(
+                    f"- {item.get('step_label') or item.get('phase') or item.get('kind')} "
+                    f"[{item.get('status')}] pid={item.get('pid')} age={age}s "
+                    f"run_dir={item.get('run_dir') or '(none)'}"
+                )
         _reply(message, "\n".join(lines))
 
     @bot.message_handler(commands=["pause"])
@@ -3262,6 +3828,11 @@ def _kill_child_procs():
         try:
             if proc.poll() is None:
                 _log(f"killing child claude pid={proc.pid}")
+                _mark_claude_invocation_pid_status(
+                    proc.pid,
+                    status="killed",
+                    detail="killed by Arbos supervisor",
+                )
                 proc.kill()
                 proc.wait(timeout=5)
         except Exception:
@@ -3315,29 +3886,43 @@ def _send_cli(args: list[str]):
 
     smf = STEP_MSG_FILE
     smf.parent.mkdir(parents=True, exist_ok=True)
+    current_stream_id = os.environ.get(ARBOS_STEP_STREAM_ID_ENV, "").strip()
 
     if smf.exists():
         try:
             state = json.loads(smf.read_text())
             msg_id = state["msg_id"]
             prev_text = state.get("text", "")
+            owner_stream_id = state.get("stream_id", "")
         except (json.JSONDecodeError, KeyError):
             msg_id = None
             prev_text = ""
+            owner_stream_id = ""
     else:
         msg_id = None
         prev_text = ""
+        owner_stream_id = ""
 
-    if msg_id:
+    owns_step_message = bool(current_stream_id and (not owner_stream_id or owner_stream_id == current_stream_id))
+
+    if msg_id and owns_step_message:
         combined = (prev_text + "\n\n" + text).strip()
         if _edit_telegram_text(msg_id, combined):
-            smf.write_text(json.dumps({"msg_id": msg_id, "text": combined}))
+            smf.write_text(json.dumps({
+                "msg_id": msg_id,
+                "text": combined,
+                "stream_id": current_stream_id,
+            }))
             log_chat("bot", combined[:1000])
             print(f"Edited step message ({len(combined)} chars)")
         else:
             new_id = _send_telegram_new(text)
             if new_id:
-                smf.write_text(json.dumps({"msg_id": new_id, "text": text}))
+                smf.write_text(json.dumps({
+                    "msg_id": new_id,
+                    "text": text,
+                    "stream_id": current_stream_id,
+                }))
                 log_chat("bot", text[:1000])
                 print(f"Sent new message ({len(text)} chars)")
             else:
@@ -3346,7 +3931,6 @@ def _send_cli(args: list[str]):
     else:
         new_id = _send_telegram_new(text)
         if new_id:
-            smf.write_text(json.dumps({"msg_id": new_id, "text": text}))
             log_chat("bot", text[:1000])
             print(f"Sent ({len(text)} chars)")
         else:
@@ -3424,6 +4008,7 @@ def main() -> None:
     CONTEXT_LOGS_DIR.mkdir(parents=True, exist_ok=True)
     CHATLOG_DIR.mkdir(parents=True, exist_ok=True)
     FILES_DIR.mkdir(parents=True, exist_ok=True)
+    _reset_claude_invocations()
 
     _load_agent()
     _log("loaded agent state from meta.json (if present)")

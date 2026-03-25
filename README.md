@@ -26,7 +26,7 @@ Arbos just loops a `GOAL.md` through a coding agent.
 ## Getting started
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/unconst/Arbos/main/run.sh | bash
+curl -fsSL https://raw.githubusercontent.com/unarbos/arbos/main/run.sh | bash
 ```
 
 ## Usage

@@ -1315,18 +1315,16 @@ def _fmt_context_for_header(
     attempt_inflight: bool,
 ) -> str:
     paid_usage = paid_usage or ClaudeUsage()
-    paid_in = _fmt_token_count(paid_usage.total_input_tokens)
+    current_tokens = paid_usage.total_input_tokens + paid_usage.output_tokens
     if attempt_inflight and est > 0:
-        return f"{paid_in} in (+ est {_fmt_token_count(est)} current)"
-    if paid_usage.total_input_tokens > 0 or paid_usage.output_tokens > 0:
-        return f"{paid_in} in, {_fmt_token_count(paid_usage.output_tokens)} out"
-    if est > 0:
-        return f"{paid_in} in (+ est {_fmt_token_count(est)} current)"
-    return "usage pending"
+        current_tokens = max(current_tokens, est)
+    elif current_tokens <= 0 and est > 0:
+        current_tokens = est
+    return _fmt_token_count(current_tokens)
 
 
 def _arbos_response_header(elapsed_s: float) -> str:
-    """First line on Telegram: elapsed + estimated or actual Claude/OpenRouter usage."""
+    """First line on Telegram: elapsed + compact current token count."""
     with _context_lock:
         est = _context_est_tokens
         paid = _context_paid_usage
@@ -1338,7 +1336,7 @@ def _arbos_response_header(elapsed_s: float) -> str:
 
 
 def _step_response_header(elapsed_s: float, step_label: str = "Step") -> str:
-    """First line on step bubbles: step label + elapsed + estimated/actual usage."""
+    """First line on step bubbles: step label + elapsed + compact current token count."""
     with _context_lock:
         est = _context_est_tokens
         paid = _context_paid_usage

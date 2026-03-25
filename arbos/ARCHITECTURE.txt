@@ -1,0 +1,36 @@
+Arbos package map
+
+Entry points
+- arbos.cli: user-facing executable wrapper
+- arbos.app: real application entrypoint
+- arbos.core: compatibility delegator only
+
+Shared state
+- arbos.runtime: authoritative process-wide runtime state and path/config globals
+- arbos.paths: immutable path-building helpers
+- arbos.config: env-derived runtime config reload
+- arbos.env: dotenv/encrypted env helpers
+
+Persistence and prompts
+- arbos.state_store: agent state save/load and GO/paused helpers
+- arbos.invocations: Claude invocation registry and run metadata
+- arbos.chatlog: rolling Telegram transcript
+- arbos.prompts: prompt assembly and env visibility sections
+
+External side effects
+- arbos.telegram_client: raw Telegram API helpers
+- arbos.claude_client: Claude subprocess and streaming
+- arbos.openrouter: OpenRouter utility calls
+- arbos.bootstrap: project/bootstrap/PM2 helpers
+
+Orchestration
+- arbos.step_runner: one-step execution and STATE sync
+- arbos.loop: loop scheduling, backoff, and cleanup
+- arbos.telegram_handlers: Telegram bot handlers and operator flows
+- arbos.health: HTTP health endpoint
+
+Rules
+- Do not add duplicate logic to arbos.core and another module.
+- Prefer explicit imports; do not use import *.
+- Raw clients should not import handlers/orchestrators.
+- Start package work from arbos.app plus the owning module above, not arbos.core.

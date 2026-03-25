@@ -267,6 +267,8 @@ fi
 
 source .venv/bin/activate
 run "Installing dependencies" uv pip install -e .
+command -v arbos >/dev/null 2>&1 || die "arbos entrypoint was not installed into the venv"
+ok "arbos entrypoint installed"
 
 mkdir -p context
 
@@ -297,11 +299,13 @@ prompt_value() {
         return 0
     fi
 
-    [ -n "$help_text" ] && printf "  ${DIM}%s${NC}\n\n" "$help_text"
+    # This function is used inside command substitution, so interactive text
+    # must go to the TTY instead of stdout or it will be swallowed.
+    [ -n "$help_text" ] && printf "  ${DIM}%s${NC}\n\n" "$help_text" >/dev/tty
     if [ -n "$default_value" ]; then
-        printf "  ${CYAN}%s${NC} [${default_value}]: " "$prompt_text"
+        printf "  ${CYAN}%s${NC} [${default_value}]: " "$prompt_text" >/dev/tty
     else
-        printf "  ${CYAN}%s:${NC} " "$prompt_text"
+        printf "  ${CYAN}%s:${NC} " "$prompt_text" >/dev/tty
     fi
     read -r val </dev/tty 2>/dev/null || val=""
     val="${val:-$default_value}"
@@ -312,17 +316,79 @@ prompt_value() {
     printf "%s" "$val"
 }
 
-OPENROUTER_API_KEY_VALUE="$(prompt_value "OPENROUTER_API_KEY" \
-    "OpenRouter API key" \
-    "Get yours at: https://openrouter.ai/keys" \
-    "required")"
+project_env_value() {
+    local project_dir="$1" key_name="$2" env_file="$1/.env"
+    [ -f "$env_file" ] || return 0
+    (
+        set -a
+        # shellcheck source=/dev/null
+        source "$env_file" >/dev/null 2>&1 || exit 0
+        set +a
+        eval "printf '%s' \"\${$key_name:-}\""
+    )
+}
+
+EXISTING_PROJECT_DIRS=()
+SELECTED_PROJECT_DIR=""
+
+if [ -d "$INSTALL_DIR/context" ]; then
+    for project_dir in "$INSTALL_DIR"/context/*; do
+        [ -d "$project_dir" ] || continue
+        EXISTING_PROJECT_DIRS+=("$project_dir")
+    done
+fi
+
+if [ -n "${TAU_BOT_TOKEN:-}" ]; then
+    TAU_BOT_TOKEN_VALUE="$TAU_BOT_TOKEN"
+elif [ "$HAS_TTY" = true ] && [ ${#EXISTING_PROJECT_DIRS[@]} -gt 0 ]; then
+    printf "  ${DIM}Choose an existing bot or create a new one.${NC}\n\n" >/dev/tty
+    option_idx=1
+    for project_dir in "${EXISTING_PROJECT_DIRS[@]}"; do
+        printf "  [%d] %s\n" "$option_idx" "$(basename "$project_dir")" >/dev/tty
+        option_idx=$((option_idx + 1))
+    done
+    printf "  [%d] new token\n\n" "$option_idx" >/dev/tty
+    printf "  ${CYAN}Select bot:${NC} " >/dev/tty
+    read -r bot_choice </dev/tty 2>/dev/null || bot_choice=""
+
+    case "$bot_choice" in
+        ''|*[!0-9]*)
+            die "Please enter a number from 1 to $option_idx"
+            ;;
+    esac
+
+    if [ "$bot_choice" -ge 1 ] && [ "$bot_choice" -lt "$option_idx" ]; then
+        SELECTED_PROJECT_DIR="${EXISTING_PROJECT_DIRS[$((bot_choice - 1))]}"
+        TAU_BOT_TOKEN_VALUE="$(project_env_value "$SELECTED_PROJECT_DIR" "TAU_BOT_TOKEN")"
+        [ -n "$TAU_BOT_TOKEN_VALUE" ] || die "Selected project is missing TAU_BOT_TOKEN in .env"
+        ok "Using saved token from $(basename "$SELECTED_PROJECT_DIR")"
+    elif [ "$bot_choice" -eq "$option_idx" ]; then
+        TAU_BOT_TOKEN_VALUE="$(prompt_value "TAU_BOT_TOKEN" \
+            "Telegram bot token" \
+            "Create a bot via @BotFather on Telegram, then paste the token here" \
+            "required")"
+    else
+        die "Please enter a number from 1 to $option_idx"
+    fi
+else
+    TAU_BOT_TOKEN_VALUE="$(prompt_value "TAU_BOT_TOKEN" \
+        "Telegram bot token" \
+        "Create a bot via @BotFather on Telegram, then paste the token here" \
+        "required")"
+fi
 
 printf "\n\n"
 
-TAU_BOT_TOKEN_VALUE="$(prompt_value "TAU_BOT_TOKEN" \
-    "Telegram bot token" \
-    "Create a bot via @BotFather on Telegram, then paste the token here" \
-    "required")"
+OPENROUTER_DEFAULT_VALUE="${OPENROUTER_API_KEY:-}"
+if [ -z "$OPENROUTER_DEFAULT_VALUE" ] && [ -n "$SELECTED_PROJECT_DIR" ]; then
+    OPENROUTER_DEFAULT_VALUE="$(project_env_value "$SELECTED_PROJECT_DIR" "OPENROUTER_API_KEY")"
+fi
+
+OPENROUTER_API_KEY_VALUE="$(prompt_value "OPENROUTER_API_KEY" \
+    "OpenRouter API key" \
+    "Get yours at: https://openrouter.ai/keys" \
+    "required" \
+    "$OPENROUTER_DEFAULT_VALUE")"
 
 printf "\n"
 
@@ -332,24 +398,8 @@ PROJECT_NAME="$(source "$INSTALL_DIR/.venv/bin/activate" && arbos bot-name --bot
 PROJECT_DIR="$INSTALL_DIR/context/$PROJECT_NAME"
 WORKSPACE_DIR="$PROJECT_DIR/workspace"
 PM2_NAME="arbos-$PROJECT_NAME"
-HEALTH_DEFAULT="$(PROJECT_NAME="$PROJECT_NAME" python3 - <<'PY'
-import hashlib
-import os
-name = os.environ["PROJECT_NAME"]
-digest = hashlib.sha1(name.encode("utf-8")).hexdigest()
-print(8200 + (int(digest[:4], 16) % 2000))
-PY
-)"
 
 printf "  ${DIM}Canonical bot name: %s${NC}\n\n" "$PROJECT_NAME"
-
-ARBOS_HEALTH_PORT_VALUE="$(prompt_value "ARBOS_HEALTH_PORT" \
-    "Health port" \
-    "Each bot instance should use its own local health port." \
-    "required" \
-    "$HEALTH_DEFAULT")"
-
-printf "\n"
 
 # ── 7. Start Arbos ───────────────────────────────────────────────────────────
 
@@ -376,7 +426,8 @@ BOOTSTRAP_OUTPUT="$(
     export OPENROUTER_API_KEY="$OPENROUTER_API_KEY_VALUE"
     export TAU_BOT_TOKEN="$TAU_BOT_TOKEN_VALUE"
     source "$INSTALL_DIR/.venv/bin/activate"
-    arbos bootstrap-project --health-port "$ARBOS_HEALTH_PORT_VALUE"
+    command -v arbos >/dev/null 2>&1 || { echo "arbos entrypoint missing in venv" >&2; exit 1; }
+    arbos bootstrap-project
 )"
 
 printf "\n"

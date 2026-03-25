@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [tool.setuptools]
-py-modules = ["arbos"]
+packages = ["arbos"]
 
 [project.scripts]
-arbos = "arbos:main"
+arbos = "arbos.cli:main"

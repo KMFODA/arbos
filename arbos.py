@@ -6,6 +6,7 @@ import os
 import selectors
 import signal
 import shutil
+import shlex
 import subprocess
 import sys
 import time
@@ -1881,7 +1882,7 @@ Arbos:
 - /model [provider/model]
 - /new <bot_token>
 - /restart
-- /env KEY VAL DESC
+- /env KEY "VALUE" [DESCRIPTION]
 """
 
 
@@ -4210,15 +4211,20 @@ def run_bot():
             _reject(message)
             return
         _save_operator_telegram(message)
-        parts = (message.text or "").split(None, 3)
-        if len(parts) < 4:
+        try:
+            parts = shlex.split(message.text or "")
+        except ValueError as exc:
+            _reply(message, f"Invalid /env syntax: {exc}")
+            return
+        if len(parts) < 3:
             _reply(
                 message,
-                "Usage: /env KEY VALUE DESCRIPTION\n"
-                "VALUE must be one word (no spaces). Description can be several words.",
+                'Usage: /env KEY "VALUE" [DESCRIPTION]\n'
+                "Quote VALUE when it contains spaces, such as mnemonic phrases.",
             )
             return
-        _, key, value, description = parts
+        _, key, value, *description_parts = parts
+        description = " ".join(description_parts).strip() or "Set via Telegram /env command."
         ok, msg = _persist_env_var_with_comment(key, value, description)
         _reply(message, msg if ok else f"Error: {msg}")
         if ok:

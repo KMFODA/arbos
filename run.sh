@@ -397,7 +397,7 @@ printf "  /clear (clear loop)\n"
 printf "  /delay <mins> (loop delay)\n"
 printf "  /new <bot token> (create a fresh sibling bot)\n"
 printf "  /restart (restart Arbos)\n"
-printf "  /env KEY VAL DESC (add env)\n"
+printf "  /env KEY \"VALUE\" [DESC] (add env; quote values with spaces)\n"
 printf "\n"
 
 sleep 2

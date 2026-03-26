@@ -19,6 +19,9 @@ from .prompts import _path_for_display, load_prompt
 from .state import _mark_claude_invocation_pid_status, _reset_claude_invocations, _save_agent, _utc_now_iso, log_chat, make_run_dir
 from .telegram import TELEGRAM_SAFE_TEXT, _build_agent_failure_detail, _edit_telegram_text, _send_telegram_new, _send_telegram_text, _step_update_target, _tail_text_for_telegram, _truncate_telegram_text
 
+STEP_BUBBLE_EDIT_INTERVAL_SECONDS = 6.0
+STEP_BUBBLE_HEARTBEAT_SECONDS = 15.0
+
 def _strip_state_autosync_block(text: str) -> str:
     """Remove the host-managed STATE.md footer while preserving agent notes."""
     raw = text or ''
@@ -144,7 +147,7 @@ def run_step(prompt: str, step_number: int, agent_step: int=0, *, force_step: bo
         if not force and now - last_edit < min_interval:
             return
         body = _truncate_telegram_text(text)
-        ok = _edit_telegram_text(step_msg_id, body, target=target)
+        ok = _edit_telegram_text(step_msg_id, body, target=target, force=force)
         if not ok and fallback_send:
             _log('step message edit failed; sending new Telegram message with final state')
             new_id = _send_telegram_new('[step: could not edit in-place]\n\n' + body, target=target)
@@ -167,17 +170,17 @@ def run_step(prompt: str, step_number: int, agent_step: int=0, *, force_step: bo
         _rollout_buf[0] = streaming
         elapsed_s = time.monotonic() - t0
         bubble = _format_step_live_bubble(elapsed_s, step_label, _redact_secrets(streaming), _last_activity[0] or '')
-        _edit_step_msg(bubble, min_interval=1.0)
+        _edit_step_msg(bubble, min_interval=STEP_BUBBLE_EDIT_INTERVAL_SECONDS)
 
     def _on_activity(status: str):
         _operator_tick()
         _last_activity[0] = status
         elapsed_s = time.monotonic() - t0
         bubble = _format_step_live_bubble(elapsed_s, step_label, _redact_secrets(_rollout_buf[0]), status)
-        _edit_step_msg(bubble, min_interval=1.2)
+        _edit_step_msg(bubble, min_interval=STEP_BUBBLE_EDIT_INTERVAL_SECONDS)
 
     def _heartbeat():
-        while not _heartbeat_stop.wait(timeout=3.0):
+        while not _heartbeat_stop.wait(timeout=STEP_BUBBLE_HEARTBEAT_SECONDS):
             _operator_tick()
             elapsed_s = time.monotonic() - t0
             status = _last_activity[0] or 'working ...'
@@ -198,7 +201,7 @@ def run_step(prompt: str, step_number: int, agent_step: int=0, *, force_step: bo
         _log(f'agent step {agent_step}: executing' + (' [force]' if force_step else ''))
         threading.Thread(target=_heartbeat, daemon=True).start()
         try:
-            result = run_agent(_claude_cmd(prompt), phase='agent_step', output_file=run_dir / 'output.txt', run_dir=run_dir, invocation_kind='loop_step', step_label=step_label, prompt_est_tokens=_approx_prompt_context_tokens(prompt), extra_env={runtime_state.ARBOS_STEP_STREAM_ID_ENV: step_stream_id}, on_text=_on_text, on_activity=_on_activity)
+            result = run_agent(_claude_cmd(), phase='agent_step', output_file=run_dir / 'output.txt', run_dir=run_dir, invocation_kind='loop_step', step_label=step_label, prompt_text=prompt, prompt_est_tokens=_approx_prompt_context_tokens(prompt), extra_env={runtime_state.ARBOS_STEP_STREAM_ID_ENV: step_stream_id}, on_text=_on_text, on_activity=_on_activity)
         except Exception as exc:
             failure_summary = _redact_secrets(f'{type(exc).__name__}: {exc}')[:800]
             _log(f'run_step: run_agent raised: {failure_summary}')
@@ -349,7 +352,7 @@ def _agent_loop():
             if pre_id:
                 tgt = _step_update_target()
                 if tgt:
-                    _edit_telegram_text(pre_id, _truncate_telegram_text('Step skipped: empty prompt. Add GOAL/STATE or use /loop.'), target=tgt)
+                    _edit_telegram_text(pre_id, _truncate_telegram_text('Step skipped: empty prompt. Add GOAL/STATE or use /loop.'), target=tgt, force=True)
                 runtime_state.STEP_MSG_FILE.unlink(missing_ok=True)
             _agent_wait(gs, 5.0)
             continue

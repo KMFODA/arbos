@@ -55,7 +55,7 @@ def _send_cli(args: list[str]):
     owns_step_message = bool(current_stream_id and (not owner_stream_id or owner_stream_id == current_stream_id))
     if msg_id and owns_step_message:
         combined = (prev_text + '\n\n' + text).strip()
-        if _edit_telegram_text(msg_id, combined):
+        if _edit_telegram_text(msg_id, combined, force=True):
             smf.write_text(json.dumps({'msg_id': msg_id, 'text': combined, 'stream_id': current_stream_id}))
             log_chat('bot', combined[:1000])
             print(f'Edited step message ({len(combined)} chars)')

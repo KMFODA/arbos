@@ -21,11 +21,14 @@ from .state import _agent_status_label, _claude_invocations_prompt_section, _sav
 TELEGRAM_TEXT_MAX = 4096
 TELEGRAM_SAFE_TEXT = 3900
 TELEGRAM_INLINE_RETRY_MAX_SECONDS = 8
+TELEGRAM_EDIT_MIN_INTERVAL_SECONDS = 6.0
 TELEGRAM_HELP_TEXT = 'Arbos:\n- /loop <goal>\n- /pause \n- /resume\n- /force\n- /clear\n- /delay <mins>\n- /model <model>\n- /new <token>\n- /migrate <token>\n- /restart\n- /env <k> <v> <desc>\n'
 _telegram_backoff_lock = threading.Lock()
-_telegram_backoff_until = 0.0
-_telegram_backoff_reason = ''
-_telegram_backoff_last_skip_log = 0.0
+_telegram_backoff_until: dict[str, float] = {}
+_telegram_backoff_reason: dict[str, str] = {}
+_telegram_backoff_last_skip_log: dict[str, float] = {}
+_telegram_edit_state_lock = threading.Lock()
+_telegram_edit_state: dict[tuple[int, int], dict[str, Any]] = {}
 
 def _is_leading_slash_command(message) -> bool:
     """True if the message is a Telegram-style /command (entity or leading /)."""
@@ -155,27 +158,57 @@ def _telegram_should_ignore_edit_error(source: Any) -> bool:
     (_, _, desc) = _telegram_extract_error_info(source)
     return 'message is not modified' in desc.lower()
 
+def _telegram_backoff_bucket(context: str) -> str:
+    raw = (context or '').strip()
+    folded = re.sub(r'[^a-z0-9]+', '', raw.lower())
+    if folded in {'editmessagetext', 'editmessagetextapierror', 'editmessagetextrequest'}:
+        return 'edit_message_text'
+    if folded in {'sendmessage', 'sendmessagefallback', 'sendmessagerequest'}:
+        return 'send_message'
+    return raw or 'telegram'
+
+def _telegram_edit_gate(chat_id: int, message_id: int, body: str, *, force: bool=False) -> str:
+    key = (int(chat_id), int(message_id))
+    now = time.monotonic()
+    with _telegram_edit_state_lock:
+        state = _telegram_edit_state.setdefault(key, {'last_attempt_at': 0.0, 'last_body': ''})
+        if body == state.get('last_body', ''):
+            return 'duplicate'
+        if (not force) and now - float(state.get('last_attempt_at', 0.0) or 0.0) < TELEGRAM_EDIT_MIN_INTERVAL_SECONDS:
+            return 'throttled'
+        state['last_attempt_at'] = now
+    return 'send'
+
+def _telegram_record_edit_success(chat_id: int, message_id: int, body: str) -> None:
+    key = (int(chat_id), int(message_id))
+    with _telegram_edit_state_lock:
+        state = _telegram_edit_state.setdefault(key, {'last_attempt_at': 0.0, 'last_body': ''})
+        state['last_body'] = body
+        state['last_attempt_at'] = time.monotonic()
+
 def _telegram_note_backoff(context: str, code: int | None, retry_after: int | None, desc: str) -> None:
     if not retry_after or retry_after <= 0:
         return
     now = time.monotonic()
     until = now + retry_after
+    bucket = _telegram_backoff_bucket(context)
     with _telegram_backoff_lock:
-        global _telegram_backoff_until, _telegram_backoff_reason
-        if until > _telegram_backoff_until:
-            _telegram_backoff_until = until
-            _telegram_backoff_reason = f'{context} rate limited ({code or "?"}: {desc[:120]})'
+        current_until = _telegram_backoff_until.get(bucket, 0.0)
+        if until > current_until:
+            _telegram_backoff_until[bucket] = until
+            _telegram_backoff_reason[bucket] = f'{context} rate limited ({code or "?"}: {desc[:120]})'
     _log(f'telegram {context} rate limited; suppressing outbound requests for {retry_after}s ({desc[:220]})')
 
 def _telegram_skip_due_to_backoff(context: str) -> bool:
     now = time.monotonic()
+    bucket = _telegram_backoff_bucket(context)
     with _telegram_backoff_lock:
-        global _telegram_backoff_last_skip_log
-        remaining = _telegram_backoff_until - now
-        reason = _telegram_backoff_reason
-        should_log = remaining > 0 and (now - _telegram_backoff_last_skip_log >= 30.0)
+        remaining = _telegram_backoff_until.get(bucket, 0.0) - now
+        reason = _telegram_backoff_reason.get(bucket, '')
+        last_skip_log = _telegram_backoff_last_skip_log.get(bucket, 0.0)
+        should_log = remaining > 0 and (now - last_skip_log >= 30.0)
         if should_log:
-            _telegram_backoff_last_skip_log = now
+            _telegram_backoff_last_skip_log[bucket] = now
     if remaining <= 0:
         return False
     if should_log:
@@ -212,23 +245,44 @@ def _telegram_bot_send_message(bot: Any, chat_id: int, text: str, **kwargs) -> A
             raise
     return None
 
-def _telegram_bot_edit_message_text(bot: Any, text: str, chat_id: int, message_id: int) -> bool:
+def _telegram_bot_edit_message_text(bot: Any, text: str, chat_id: int, message_id: int, *, force: bool=False) -> bool:
     body = _truncate_telegram_text(_redact_secrets(text))[:TELEGRAM_TEXT_MAX]
+    edit_gate = _telegram_edit_gate(chat_id, message_id, body, force=force)
+    if edit_gate == 'duplicate':
+        return True
+    if edit_gate != 'send':
+        return False
     if _telegram_skip_due_to_backoff('edit_message_text'):
         return False
     for attempt in (1, 2):
         try:
             bot.edit_message_text(body, chat_id, message_id)
+            _telegram_record_edit_success(chat_id, message_id, body)
             return True
         except Exception as exc:
             if _telegram_should_ignore_edit_error(exc):
+                _telegram_record_edit_success(chat_id, message_id, body)
                 return True
             if _telegram_should_retry('edit_message_text', exc, attempt):
                 continue
             raise
     return False
 
-def _telegram_api_request(method: str, token: str, payload: dict[str, Any], *, timeout: int=15) -> dict[str, Any] | None:
+def _telegram_api_request(method: str, token: str, payload: dict[str, Any], *, timeout: int=15, force: bool=False) -> dict[str, Any] | None:
+    bucket = _telegram_backoff_bucket(method)
+    if bucket == 'edit_message_text':
+        try:
+            chat_id = int(payload.get('chat_id'))
+            message_id = int(payload.get('message_id'))
+        except (TypeError, ValueError):
+            chat_id = None
+            message_id = None
+        body = str(payload.get('text') or '')[:TELEGRAM_TEXT_MAX]
+        if chat_id is not None and message_id is not None:
+            edit_gate = _telegram_edit_gate(chat_id, message_id, body, force=force)
+            if edit_gate != 'send':
+                desc = 'message is not modified' if edit_gate == 'duplicate' else 'local edit throttle'
+                return {'ok': False, 'description': desc, '__arbos_local_skip': edit_gate}
     if _telegram_skip_due_to_backoff(method):
         return None
     url = f'https://api.telegram.org/bot{token}/{method}'
@@ -257,6 +311,8 @@ def _telegram_api_request(method: str, token: str, payload: dict[str, Any], *, t
             _log(f'telegram {method} returned non-JSON success response')
             return None
         err_source: Any = data if isinstance(data, dict) else response
+        if bucket == 'edit_message_text' and _telegram_should_ignore_edit_error(err_source):
+            return {'ok': False, 'description': 'message is not modified'}
         if _telegram_should_retry(method, err_source, attempt):
             continue
         (_, _, desc) = _telegram_extract_error_info(err_source)
@@ -382,7 +438,7 @@ def _send_telegram_new(text: str, *, target: tuple[str, str, int | None] | None=
         return None
     return data.get('result', {}).get('message_id')
 
-def _edit_telegram_text(message_id: int, text: str, *, target: tuple[str, str, int | None] | None=None) -> bool:
+def _edit_telegram_text(message_id: int, text: str, *, target: tuple[str, str, int | None] | None=None, force: bool=False) -> bool:
     """Edit an existing Telegram message."""
     target = target or _step_update_target()
     if not target:
@@ -392,11 +448,17 @@ def _edit_telegram_text(message_id: int, text: str, *, target: tuple[str, str, i
     payload: dict[str, Any] = {'chat_id': chat_id, 'message_id': message_id, 'text': text[:TELEGRAM_TEXT_MAX]}
     if thread_id is not None:
         payload['message_thread_id'] = thread_id
-    data = _telegram_api_request('editMessageText', token, payload, timeout=15)
+    data = _telegram_api_request('editMessageText', token, payload, timeout=15, force=force)
     if not isinstance(data, dict):
+        return False
+    local_skip = data.get('__arbos_local_skip')
+    if local_skip == 'duplicate':
+        return True
+    if local_skip:
         return False
     (ok, desc) = _telegram_result_ok(data)
     if ok or 'message is not modified' in desc.lower():
+        _telegram_record_edit_success(int(chat_id), int(message_id), text[:TELEGRAM_TEXT_MAX])
         return True
     _log(f'telegram editMessageText API error: {desc[:300]}')
     return False

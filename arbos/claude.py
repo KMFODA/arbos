@@ -3,6 +3,7 @@ import json
 import os
 import selectors
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -15,8 +16,11 @@ from .runtime import _operator_set, _operator_tick
 from .state import _finalize_claude_invocation, _mark_claude_invocation_pid_status, _register_claude_invocation, _summarize_claude_cmd, make_run_dir
 from .telegram import TELEGRAM_TEXT_MAX, _streaming_empty_summary, _tail_text_for_telegram, _telegram_bot_edit_message_text, _telegram_bot_send_message, _telegram_send_message_fallback, _truncate_telegram_text
 
-def _claude_cmd(prompt: str, extra_flags: list[str] | None=None) -> list[str]:
-    cmd = ['claude', '-p', prompt]
+OPERATOR_BUBBLE_EDIT_INTERVAL_SECONDS = 6.0
+OPERATOR_BUBBLE_HEARTBEAT_SECONDS = 15.0
+
+def _claude_cmd(extra_flags: list[str] | None=None) -> list[str]:
+    cmd = ['claude', '-p', '--input-format', 'text']
     if not runtime_state.IS_ROOT:
         cmd.append('--dangerously-skip-permissions')
     cmd.extend(['--output-format', 'stream-json', '--verbose'])
@@ -82,7 +86,7 @@ def _prefer_richer_assistant_text(result_text: str, complete_texts: list[str], s
         return longest
     return r if r else longest
 
-def _run_claude_once(cmd, env, on_text=None, on_activity=None, *, invocation_meta: dict[str, Any] | None=None):
+def _run_claude_once(cmd, env, prompt_text: str='', on_text=None, on_activity=None, *, invocation_meta: dict[str, Any] | None=None):
     """Run a single claude subprocess, return (returncode, result_text, raw_lines, stderr, usage).
 
     on_text: optional callback(accumulated_text) fired as assistant text streams in.
@@ -92,7 +96,15 @@ def _run_claude_once(cmd, env, on_text=None, on_activity=None, *, invocation_met
     when the process ends). Stderr is drained continuously so a chatty CLI cannot deadlock
     on a full PIPE buffer.
     """
-    proc = subprocess.Popen(cmd, cwd=runtime_state.PROJECT_DIR, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    prompt_input = None
+    stdin_source = subprocess.DEVNULL
+    if prompt_text:
+        # Feed the prompt via stdin so large contexts do not exceed exec argv limits.
+        prompt_input = tempfile.TemporaryFile(mode='w+t', encoding='utf-8')
+        prompt_input.write(prompt_text)
+        prompt_input.seek(0)
+        stdin_source = prompt_input
+    proc = subprocess.Popen(cmd, cwd=runtime_state.PROJECT_DIR, env=env, stdin=stdin_source, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
     with runtime_state._child_procs_lock:
         runtime_state._child_procs.add(proc)
     invocation_id = None
@@ -184,6 +196,11 @@ def _run_claude_once(cmd, env, on_text=None, on_activity=None, *, invocation_met
             except (KeyError, ValueError):
                 pass
         sel.close()
+        if prompt_input is not None:
+            try:
+                prompt_input.close()
+            except OSError:
+                pass
     if proc.stdout:
         try:
             rest = proc.stdout.read()
@@ -215,7 +232,7 @@ def _run_claude_once(cmd, env, on_text=None, on_activity=None, *, invocation_met
     _finalize_claude_invocation(invocation_id, returncode=returncode, stderr_output=stderr_output, usage=usage, status='timed_out' if timed_out else None)
     return (returncode, result_text, raw_lines, stderr_output, usage)
 
-def run_agent(cmd: list[str], phase: str, output_file: Path, *, run_dir: Path | None=None, invocation_kind: str='loop_step', step_label: str | None=None, prompt_est_tokens: int=0, extra_env: dict[str, str] | None=None, on_text=None, on_activity=None) -> subprocess.CompletedProcess:
+def run_agent(cmd: list[str], phase: str, output_file: Path, *, run_dir: Path | None=None, invocation_kind: str='loop_step', step_label: str | None=None, prompt_text: str='', prompt_est_tokens: int=0, extra_env: dict[str, str] | None=None, on_text=None, on_activity=None) -> subprocess.CompletedProcess:
     env = _claude_env()
     if extra_env:
         env.update(extra_env)
@@ -225,7 +242,7 @@ def run_agent(cmd: list[str], phase: str, output_file: Path, *, run_dir: Path | 
         _log(f'{phase}: starting (attempt={attempt}) flags=[{flags}]')
         _mark_prompt_context_attempt_started(prompt_est_tokens)
         t0 = time.monotonic()
-        (returncode, result_text, raw_lines, stderr_output, usage) = _run_claude_once(cmd, env, on_text=on_text, on_activity=on_activity, invocation_meta={'kind': invocation_kind, 'phase': phase, 'run_dir': run_dir, 'attempt': attempt, 'prompt_est_tokens': prompt_est_tokens, 'step_label': step_label})
+        (returncode, result_text, raw_lines, stderr_output, usage) = _run_claude_once(cmd, env, prompt_text=prompt_text, on_text=on_text, on_activity=on_activity, invocation_meta={'kind': invocation_kind, 'phase': phase, 'run_dir': run_dir, 'attempt': attempt, 'prompt_est_tokens': prompt_est_tokens, 'step_label': step_label})
         paid_usage = _record_prompt_context_usage(usage)
         elapsed = time.monotonic() - t0
         output_file.write_text(_redact_secrets(''.join(raw_lines)))
@@ -273,7 +290,7 @@ def run_agent_streaming(bot, prompt: str, chat_id: int, *, reply_to_message_id: 
     topic. Without it, Telegram posts to the General topic while replies would
     still land in the topic of the quoted message.
     """
-    cmd = _claude_cmd(prompt)
+    cmd = _claude_cmd()
     t0 = time.monotonic()
     _reset_prompt_context_usage(prompt)
 
@@ -341,20 +358,20 @@ def run_agent_streaming(bot, prompt: str, chat_id: int, *, reply_to_message_id: 
     (last_rc, last_stderr) = (0, '')
 
     def _stream_heartbeat():
-        while not _heartbeat_stop.wait(timeout=3.0):
+        while not _heartbeat_stop.wait(timeout=OPERATOR_BUBBLE_HEARTBEAT_SECONDS):
             _operator_tick()
             _paint(force=True, refresh_only=True)
 
     def _paint(force: bool=False, *, refresh_only: bool=False, send_if_edit_fails: bool=False):
         nonlocal last_edit, msg
         now = time.time()
-        if not force and (not refresh_only) and (now - last_edit < 1.5):
+        if not force and (not refresh_only) and (now - last_edit < OPERATOR_BUBBLE_EDIT_INTERVAL_SECONDS):
             return
         display = _redact_secrets(_format_display(_display_core()))
         if not display.strip():
             return
         try:
-            if _telegram_bot_edit_message_text(bot, display, chat_id, msg.message_id):
+            if _telegram_bot_edit_message_text(bot, display, chat_id, msg.message_id, force=force):
                 last_edit = now
         except Exception as exc:
             _log(f'run_agent_streaming: edit_message_text failed: {str(exc)[:220]}')
@@ -373,7 +390,7 @@ def run_agent_streaming(bot, prompt: str, chat_id: int, *, reply_to_message_id: 
         if c:
             body = _redact_secrets(_format_display(c))
             try:
-                _telegram_bot_edit_message_text(bot, body, chat_id, msg.message_id)
+                _telegram_bot_edit_message_text(bot, body, chat_id, msg.message_id, force=True)
             except Exception as exc:
                 _log(f'run_agent_streaming: freeze-segment edit failed: {str(exc)[:220]}')
                 try:
@@ -430,7 +447,7 @@ def run_agent_streaming(bot, prompt: str, chat_id: int, *, reply_to_message_id: 
             _log(f'run_agent_streaming: attempt {attempt}/{runtime_state.MAX_RETRIES} starting')
             _mark_prompt_context_attempt_started(_approx_prompt_context_tokens(prompt))
             t_attempt = time.monotonic()
-            (returncode, result_text, raw_lines, stderr_output, usage) = _run_claude_once(cmd, env, on_text=_on_text, on_activity=_on_activity, invocation_meta={'kind': 'operator_chat', 'phase': 'operator_chat', 'run_dir': run_dir, 'attempt': attempt, 'prompt_est_tokens': _approx_prompt_context_tokens(prompt), 'step_label': 'operator chat'})
+            (returncode, result_text, raw_lines, stderr_output, usage) = _run_claude_once(cmd, env, prompt_text=prompt, on_text=_on_text, on_activity=_on_activity, invocation_meta={'kind': 'operator_chat', 'phase': 'operator_chat', 'run_dir': run_dir, 'attempt': attempt, 'prompt_est_tokens': _approx_prompt_context_tokens(prompt), 'step_label': 'operator chat'})
             last_raw_lines = raw_lines
             paid_usage = _record_prompt_context_usage(usage)
             (last_rc, last_stderr) = (returncode, stderr_output)
@@ -484,7 +501,7 @@ def run_agent_streaming(bot, prompt: str, chat_id: int, *, reply_to_message_id: 
         _operator_set('operator_chat_error', 'Telegram operator run crashed', last_error=f'{type(e).__name__}: {e}'[:800])
         err_body = _truncate_telegram_text(f'{_arbos_response_header(_elapsed())}\n\nArbos error (operator run):\n{type(e).__name__}: {e}')
         try:
-            _telegram_bot_edit_message_text(bot, _redact_secrets(err_body), chat_id, msg.message_id)
+            _telegram_bot_edit_message_text(bot, _redact_secrets(err_body), chat_id, msg.message_id, force=True)
         except Exception as exc:
             _log(f'run_agent_streaming: could not edit with error text: {str(exc)[:200]}')
             try:

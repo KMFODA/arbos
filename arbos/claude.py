@@ -13,7 +13,7 @@ from .env import _redact_secrets
 from .logs import _approx_prompt_context_tokens, _arbos_response_header, _format_tool_activity, _log, _mark_prompt_context_attempt_started, _parse_result_usage, _record_prompt_context_usage, _reset_prompt_context_usage, fmt_duration
 from .runtime import _operator_set, _operator_tick
 from .state import _finalize_claude_invocation, _mark_claude_invocation_pid_status, _register_claude_invocation, _summarize_claude_cmd, make_run_dir
-from .telegram import TELEGRAM_TEXT_MAX, _streaming_empty_summary, _tail_text_for_telegram, _telegram_send_message_fallback, _truncate_telegram_text
+from .telegram import TELEGRAM_TEXT_MAX, _streaming_empty_summary, _tail_text_for_telegram, _telegram_bot_edit_message_text, _telegram_bot_send_message, _telegram_send_message_fallback, _truncate_telegram_text
 
 def _claude_cmd(prompt: str, extra_flags: list[str] | None=None) -> list[str]:
     cmd = ['claude', '-p', prompt]
@@ -354,14 +354,15 @@ def run_agent_streaming(bot, prompt: str, chat_id: int, *, reply_to_message_id: 
         if not display.strip():
             return
         try:
-            bot.edit_message_text(display, chat_id, msg.message_id)
-            last_edit = now
+            if _telegram_bot_edit_message_text(bot, display, chat_id, msg.message_id):
+                last_edit = now
         except Exception as exc:
             _log(f'run_agent_streaming: edit_message_text failed: {str(exc)[:220]}')
             if send_if_edit_fails:
                 try:
-                    bot.send_message(chat_id, display[:TELEGRAM_TEXT_MAX], **_reply_kw)
-                    _log('run_agent_streaming: sent fallback new message after edit failure')
+                    sent = _telegram_bot_send_message(bot, chat_id, display[:TELEGRAM_TEXT_MAX], **_reply_kw)
+                    if sent is not None:
+                        _log('run_agent_streaming: sent fallback new message after edit failure')
                 except Exception as exc2:
                     _log(f'run_agent_streaming: fallback send_message failed: {str(exc2)[:220]}')
 
@@ -372,18 +373,21 @@ def run_agent_streaming(bot, prompt: str, chat_id: int, *, reply_to_message_id: 
         if c:
             body = _redact_secrets(_format_display(c))
             try:
-                bot.edit_message_text(body, chat_id, msg.message_id)
+                _telegram_bot_edit_message_text(bot, body, chat_id, msg.message_id)
             except Exception as exc:
                 _log(f'run_agent_streaming: freeze-segment edit failed: {str(exc)[:220]}')
                 try:
-                    bot.send_message(chat_id, body[:TELEGRAM_TEXT_MAX], **_reply_kw)
-                    _log('run_agent_streaming: freeze segment sent as new message after edit fail')
+                    sent = _telegram_bot_send_message(bot, chat_id, body[:TELEGRAM_TEXT_MAX], **_reply_kw)
+                    if sent is not None:
+                        _log('run_agent_streaming: freeze segment sent as new message after edit fail')
                 except Exception as exc2:
                     _log(f'run_agent_streaming: freeze segment send_message failed: {str(exc2)[:220]}')
             _segment_done.append(c)
         core_new = (new_seg_raw or '').strip() or '…'
         try:
-            msg = bot.send_message(chat_id, _redact_secrets(_format_display(core_new)), **_reply_kw)
+            new_msg = _telegram_bot_send_message(bot, chat_id, _redact_secrets(_format_display(core_new)), **_reply_kw)
+            if new_msg is not None:
+                msg = new_msg
         except Exception as exc:
             _log(f'run_agent_streaming: new-segment send_message failed: {str(exc)[:250]}')
 
@@ -471,7 +475,7 @@ def run_agent_streaming(bot, prompt: str, chat_id: int, *, reply_to_message_id: 
             fallback = _streaming_empty_summary(last_rc, last_stderr, last_attempt)
             _log(f'run_agent_streaming: final still empty; pushing diagnostic len={len(fallback)}')
             try:
-                bot.send_message(chat_id, _redact_secrets(_format_display(fallback))[:TELEGRAM_TEXT_MAX], **_reply_kw)
+                _telegram_bot_send_message(bot, chat_id, _redact_secrets(_format_display(fallback))[:TELEGRAM_TEXT_MAX], **_reply_kw)
             except Exception as exc:
                 _log(f'run_agent_streaming: could not send final diagnostic: {str(exc)[:200]}')
     except Exception as e:
@@ -480,11 +484,11 @@ def run_agent_streaming(bot, prompt: str, chat_id: int, *, reply_to_message_id: 
         _operator_set('operator_chat_error', 'Telegram operator run crashed', last_error=f'{type(e).__name__}: {e}'[:800])
         err_body = _truncate_telegram_text(f'{_arbos_response_header(_elapsed())}\n\nArbos error (operator run):\n{type(e).__name__}: {e}')
         try:
-            bot.edit_message_text(_redact_secrets(err_body), chat_id, msg.message_id)
+            _telegram_bot_edit_message_text(bot, _redact_secrets(err_body), chat_id, msg.message_id)
         except Exception as exc:
             _log(f'run_agent_streaming: could not edit with error text: {str(exc)[:200]}')
             try:
-                bot.send_message(chat_id, _redact_secrets(err_body)[:TELEGRAM_TEXT_MAX], **_reply_kw)
+                _telegram_bot_send_message(bot, chat_id, _redact_secrets(err_body)[:TELEGRAM_TEXT_MAX], **_reply_kw)
             except Exception as exc2:
                 _log(f'run_agent_streaming: could not send error message: {str(exc2)[:200]}')
     finally:

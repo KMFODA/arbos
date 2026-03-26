@@ -2,6 +2,7 @@ from __future__ import annotations
 from datetime import datetime
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import sys
@@ -10,7 +11,7 @@ import time
 from typing import Any
 import requests
 from . import runtime as runtime_state
-from .bootstrap import _create_new_project
+from .bootstrap import _create_new_project, _migration_preflight
 from .state import load_chatlog, log_chat
 from .runtime import _reload_runtime_config
 from .env import _persist_env_var_with_comment, _process_pending_env, _redact_secrets, _save_to_encrypted_env
@@ -19,7 +20,12 @@ from .prompts import _path_for_display, format_available_env_vars_section, load_
 from .state import _agent_status_label, _claude_invocations_prompt_section, _save_agent, _write_go_flag
 TELEGRAM_TEXT_MAX = 4096
 TELEGRAM_SAFE_TEXT = 3900
-TELEGRAM_HELP_TEXT = 'Arbos:\n- /loop GOAL.md\n- /pause \n- /resume\n- /force\n- /clear\n- /delay <mins>\n- /model [provider/model]\n- /new <bot_token>\n- /restart\n- /env KEY "VALUE" [DESCRIPTION]\n'
+TELEGRAM_INLINE_RETRY_MAX_SECONDS = 8
+TELEGRAM_HELP_TEXT = 'Arbos:\n- /loop <goal>\n- /pause \n- /resume\n- /force\n- /clear\n- /delay <mins>\n- /model <model>\n- /new <token>\n- /migrate <token>\n- /restart\n- /env <k> <v> <desc>\n'
+_telegram_backoff_lock = threading.Lock()
+_telegram_backoff_until = 0.0
+_telegram_backoff_reason = ''
+_telegram_backoff_last_skip_log = 0.0
 
 def _is_leading_slash_command(message) -> bool:
     """True if the message is a Telegram-style /command (entity or leading /)."""
@@ -86,6 +92,178 @@ def _tail_text_for_telegram(text: str, limit: int) -> str:
     kept.reverse()
     return ellipsis + '\n'.join(kept)
 
+def _telegram_extract_error_info(source: Any) -> tuple[int | None, int | None, str]:
+    """Best-effort parse of Telegram API failures from bot exceptions or raw JSON."""
+    code: int | None = None
+    retry_after: int | None = None
+    description = ''
+
+    def _coerce_int(value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _consume_dict(data: dict[str, Any]) -> None:
+        nonlocal code, retry_after, description
+        if code is None:
+            code = _coerce_int(data.get('error_code'))
+        if not description and data.get('description') is not None:
+            description = str(data.get('description'))
+        params = data.get('parameters')
+        if isinstance(params, dict) and retry_after is None:
+            retry_after = _coerce_int(params.get('retry_after'))
+
+    if isinstance(source, dict):
+        _consume_dict(source)
+    else:
+        code = _coerce_int(getattr(source, 'error_code', None))
+        desc_attr = getattr(source, 'description', None)
+        if desc_attr:
+            description = str(desc_attr)
+        result_json = getattr(source, 'result_json', None)
+        if isinstance(result_json, dict):
+            _consume_dict(result_json)
+        response = getattr(source, 'response', None)
+        if response is not None:
+            status_code = getattr(response, 'status_code', None)
+            if code is None:
+                code = _coerce_int(status_code)
+            try:
+                data = response.json()
+            except Exception:
+                data = None
+            if isinstance(data, dict):
+                _consume_dict(data)
+            elif not description:
+                text = getattr(response, 'text', '')
+                if text:
+                    description = str(text)
+
+    text = description or str(source)
+    if code is None:
+        m = re.search(r'Error code:\s*(\d+)', text, flags=re.IGNORECASE)
+        if m:
+            code = int(m.group(1))
+    if retry_after is None:
+        m = re.search(r'retry(?:[_ ]after)?[^0-9]{0,16}(\d+)', text, flags=re.IGNORECASE)
+        if m:
+            retry_after = int(m.group(1))
+    return (code, retry_after, (text or '').strip())
+
+def _telegram_should_ignore_edit_error(source: Any) -> bool:
+    (_, _, desc) = _telegram_extract_error_info(source)
+    return 'message is not modified' in desc.lower()
+
+def _telegram_note_backoff(context: str, code: int | None, retry_after: int | None, desc: str) -> None:
+    if not retry_after or retry_after <= 0:
+        return
+    now = time.monotonic()
+    until = now + retry_after
+    with _telegram_backoff_lock:
+        global _telegram_backoff_until, _telegram_backoff_reason
+        if until > _telegram_backoff_until:
+            _telegram_backoff_until = until
+            _telegram_backoff_reason = f'{context} rate limited ({code or "?"}: {desc[:120]})'
+    _log(f'telegram {context} rate limited; suppressing outbound requests for {retry_after}s ({desc[:220]})')
+
+def _telegram_skip_due_to_backoff(context: str) -> bool:
+    now = time.monotonic()
+    with _telegram_backoff_lock:
+        global _telegram_backoff_last_skip_log
+        remaining = _telegram_backoff_until - now
+        reason = _telegram_backoff_reason
+        should_log = remaining > 0 and (now - _telegram_backoff_last_skip_log >= 30.0)
+        if should_log:
+            _telegram_backoff_last_skip_log = now
+    if remaining <= 0:
+        return False
+    if should_log:
+        _log(f'telegram {context} skipped during backoff; {int(remaining)}s remaining ({reason[:180]})')
+    return True
+
+def _telegram_should_retry(context: str, source: Any, attempt: int) -> bool:
+    (code, retry_after, desc) = _telegram_extract_error_info(source)
+    if code == 429:
+        delay = max(1, retry_after or 1)
+        if attempt == 1 and delay <= TELEGRAM_INLINE_RETRY_MAX_SECONDS:
+            _log(f'telegram {context} hit 429; sleeping {delay}s before retry')
+            time.sleep(delay)
+            return True
+        _telegram_note_backoff(context, code, delay, desc or 'Too Many Requests')
+        return False
+    if code in {500, 502, 503, 504} and attempt == 1:
+        delay = 2
+        _log(f'telegram {context} transient {code}; sleeping {delay}s before retry')
+        time.sleep(delay)
+        return True
+    return False
+
+def _telegram_bot_send_message(bot: Any, chat_id: int, text: str, **kwargs) -> Any | None:
+    body = _truncate_telegram_text(_redact_secrets(text))[:TELEGRAM_TEXT_MAX]
+    if _telegram_skip_due_to_backoff('send_message'):
+        return None
+    for attempt in (1, 2):
+        try:
+            return bot.send_message(chat_id, body, **kwargs)
+        except Exception as exc:
+            if _telegram_should_retry('send_message', exc, attempt):
+                continue
+            raise
+    return None
+
+def _telegram_bot_edit_message_text(bot: Any, text: str, chat_id: int, message_id: int) -> bool:
+    body = _truncate_telegram_text(_redact_secrets(text))[:TELEGRAM_TEXT_MAX]
+    if _telegram_skip_due_to_backoff('edit_message_text'):
+        return False
+    for attempt in (1, 2):
+        try:
+            bot.edit_message_text(body, chat_id, message_id)
+            return True
+        except Exception as exc:
+            if _telegram_should_ignore_edit_error(exc):
+                return True
+            if _telegram_should_retry('edit_message_text', exc, attempt):
+                continue
+            raise
+    return False
+
+def _telegram_api_request(method: str, token: str, payload: dict[str, Any], *, timeout: int=15) -> dict[str, Any] | None:
+    if _telegram_skip_due_to_backoff(method):
+        return None
+    url = f'https://api.telegram.org/bot{token}/{method}'
+    for attempt in (1, 2):
+        try:
+            response = requests.post(url, json=payload, timeout=timeout)
+        except Exception as exc:
+            if _telegram_should_retry(method, exc, attempt):
+                continue
+            _log(f'telegram {method} request failed: {str(exc)[:200]}')
+            return None
+        try:
+            data = response.json()
+        except Exception:
+            data = None
+        if response.ok:
+            if isinstance(data, dict):
+                (ok, _) = _telegram_result_ok(data)
+                if not ok:
+                    if _telegram_should_retry(method, data, attempt):
+                        continue
+                    (_, _, desc) = _telegram_extract_error_info(data)
+                    _log(f'telegram {method} API error: {desc[:300]}')
+                    return None
+                return data
+            _log(f'telegram {method} returned non-JSON success response')
+            return None
+        err_source: Any = data if isinstance(data, dict) else response
+        if _telegram_should_retry(method, err_source, attempt):
+            continue
+        (_, _, desc) = _telegram_extract_error_info(err_source)
+        _log(f'telegram {method} API error: {(desc or response.text)[:300]}')
+        return None
+    return None
+
 def _telegram_send_message_fallback(bot: Any, chat_id: int, text: str, base_kw: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
     """Send a Telegram message; drop reply/thread kwargs if the API rejects the first attempt."""
     body = _truncate_telegram_text(_redact_secrets(text))[:TELEGRAM_TEXT_MAX]
@@ -104,9 +282,13 @@ def _telegram_send_message_fallback(bot: Any, chat_id: int, text: str, base_kw: 
     last_exc: Exception | None = None
     for kw in attempts:
         try:
-            return (bot.send_message(chat_id, body, **kw), kw)
+            msg = _telegram_bot_send_message(bot, chat_id, body, **kw)
+            if msg is not None:
+                return (msg, kw)
         except Exception as e:
             last_exc = e
+    if last_exc is None and _telegram_skip_due_to_backoff('send_message'):
+        raise RuntimeError('Telegram send_message suppressed during API backoff')
     assert last_exc is not None
     raise last_exc
 
@@ -170,15 +352,12 @@ def _send_telegram_text(text: str, *, target: tuple[str, str, int | None] | None
     payload: dict[str, Any] = {'chat_id': chat_id, 'text': text[:TELEGRAM_TEXT_MAX]}
     if thread_id is not None:
         payload['message_thread_id'] = thread_id
-    try:
-        response = requests.post(f'https://api.telegram.org/bot{token}/sendMessage', json=payload, timeout=15)
-        response.raise_for_status()
-        (ok, desc) = _telegram_result_ok(response.json())
-        if not ok:
-            _log(f'telegram sendMessage API error: {desc[:300]}')
-            return False
-    except Exception as exc:
-        _log(f'telegram send failed: {str(exc)[:120]}')
+    data = _telegram_api_request('sendMessage', token, payload, timeout=15)
+    if not isinstance(data, dict):
+        return False
+    (ok, desc) = _telegram_result_ok(data)
+    if not ok:
+        _log(f'telegram sendMessage API error: {desc[:300]}')
         return False
     log_chat('bot', text[:1000])
     _log('telegram message sent')
@@ -194,18 +373,14 @@ def _send_telegram_new(text: str, *, target: tuple[str, str, int | None] | None=
     payload: dict[str, Any] = {'chat_id': chat_id, 'text': text[:TELEGRAM_TEXT_MAX]}
     if thread_id is not None:
         payload['message_thread_id'] = thread_id
-    try:
-        response = requests.post(f'https://api.telegram.org/bot{token}/sendMessage', json=payload, timeout=15)
-        response.raise_for_status()
-        data = response.json()
-        (ok, desc) = _telegram_result_ok(data)
-        if not ok:
-            _log(f'telegram sendMessage API error: {desc[:300]}')
-            return None
-        return data.get('result', {}).get('message_id')
-    except Exception as exc:
-        _log(f'telegram send failed: {str(exc)[:120]}')
+    data = _telegram_api_request('sendMessage', token, payload, timeout=15)
+    if not isinstance(data, dict):
         return None
+    (ok, desc) = _telegram_result_ok(data)
+    if not ok:
+        _log(f'telegram sendMessage API error: {desc[:300]}')
+        return None
+    return data.get('result', {}).get('message_id')
 
 def _edit_telegram_text(message_id: int, text: str, *, target: tuple[str, str, int | None] | None=None) -> bool:
     """Edit an existing Telegram message."""
@@ -217,20 +392,14 @@ def _edit_telegram_text(message_id: int, text: str, *, target: tuple[str, str, i
     payload: dict[str, Any] = {'chat_id': chat_id, 'message_id': message_id, 'text': text[:TELEGRAM_TEXT_MAX]}
     if thread_id is not None:
         payload['message_thread_id'] = thread_id
-    try:
-        response = requests.post(f'https://api.telegram.org/bot{token}/editMessageText', json=payload, timeout=15)
-        response.raise_for_status()
-        data = response.json()
-        (ok, desc) = _telegram_result_ok(data)
-        if ok:
-            return True
-        if 'message is not modified' in desc.lower():
-            return True
-        _log(f'telegram editMessageText API error: {desc[:300]}')
+    data = _telegram_api_request('editMessageText', token, payload, timeout=15)
+    if not isinstance(data, dict):
         return False
-    except Exception as exc:
-        _log(f'telegram editMessageText request failed: {str(exc)[:200]}')
-        return False
+    (ok, desc) = _telegram_result_ok(data)
+    if ok or 'message is not modified' in desc.lower():
+        return True
+    _log(f'telegram editMessageText API error: {desc[:300]}')
+    return False
 
 def _send_telegram_document(file_path: str, caption: str='', *, target: tuple[str, str, int | None] | None=None) -> bool:
     """Send a file as a Telegram document."""
@@ -660,6 +829,69 @@ def run_bot():
             return
         _reply(message, '\n'.join([f'Created @{result.identity.username}.', f'Chat: https://t.me/{result.identity.username}', f'CWD: {_path_for_display(result.project_dir)}', f"Workspace: {_path_for_display(result.project_dir / 'workspace')}", f'PM2: {result.pm2_name}', 'Fresh workspace created. Same owner copied. Open the new bot chat and send /start, then /loop ...']))
         _log(f'/new created @{result.identity.username} pm2={result.pm2_name}')
+
+    @bot.message_handler(commands=['migrate'])
+    def handle_migrate(message):
+        uid = message.from_user.id if message.from_user else None
+        if not _is_owner(uid):
+            _reject(message)
+            return
+        _save_operator_telegram(message)
+        _log('/migrate requested')
+        parts = (message.text or '').split(None, 1)
+        if len(parts) < 2 or not parts[1].strip():
+            _reply(message, 'Usage: /migrate <bot token>')
+            return
+        new_token = parts[1].strip()
+        try:
+            preflight = _migration_preflight(runtime_state.PROJECT_DIR, new_bot_token=new_token)
+            blocking = preflight.get('blocking_companion_pm2') or []
+            if blocking:
+                lines = ['Migration blocked: stop these companion pm2 services first.']
+                lines.extend((f"- {item['name']} [{item['status']}]" for item in blocking[:12]))
+                if len(blocking) > 12:
+                    lines.append(f'- ... and {len(blocking) - 12} more')
+                _reply(message, '\n'.join(lines))
+                _log('/migrate blocked by companion pm2 services')
+                return
+            arbos_bin = runtime_state.CODE_DIR / '.venv' / 'bin' / 'arbos'
+            env_file = runtime_state.PROJECT_DIR / '.env'
+            activate_path = runtime_state.CODE_DIR / '.venv' / 'bin' / 'activate'
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            migrate_log = runtime_state.CONTEXT_LOGS_DIR / f'migrate-{ts}.log'
+            command = ' '.join([
+                'sleep 1;',
+                'set -a;',
+                f'[ -f {shlex.quote(str(env_file))} ] && source {shlex.quote(str(env_file))};',
+                'set +a;',
+                f'source {shlex.quote(str(activate_path))};',
+                shlex.quote(str(arbos_bin)),
+                '-p',
+                shlex.quote(str(runtime_state.PROJECT_DIR)),
+                'migrate-bot-token',
+                '--bot-token',
+                shlex.quote(new_token),
+                '>',
+                shlex.quote(str(migrate_log)),
+                '2>&1',
+            ])
+            subprocess.Popen(
+                ['bash', '-lc', command],
+                cwd=runtime_state.CODE_DIR,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            _reply(message, _truncate_telegram_text(f'Migrate failed to start: {_redact_secrets(str(exc))[:800]}'))
+            _log(f'/migrate failed to start: {type(exc).__name__}: {_redact_secrets(str(exc))[:200]}')
+            return
+        _reply(message, '\n'.join([
+            'Starting migration in the background.',
+            f'Log: {_path_for_display(migrate_log)}',
+            'This bot may stop replying once pm2 switches over.',
+        ]))
+        _log(f'/migrate launched detached migration subprocess log={migrate_log}')
 
     @bot.message_handler(commands=['loop'])
     def handle_loop(message):

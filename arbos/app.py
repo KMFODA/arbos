@@ -9,7 +9,7 @@ import threading
 import time
 from pathlib import Path
 from . import runtime as runtime_state
-from .bootstrap import _copy_workspace_snapshot, _init_project_layout, _migrate_project_dir, _resolve_bot_identity, _seed_workspace_defaults, _start_pm2_project
+from .bootstrap import _copy_workspace_snapshot, _init_project_layout, _migrate_current_project_to_token, _migrate_project_dir, _migration_preflight, _resolve_bot_identity, _seed_workspace_defaults, _start_pm2_project
 from .claude import _write_claude_settings
 from .env import _encrypt_env_file, _find_projects_for_token, _init_env, _load_project_env_map, _process_pending_env, _project_env_comments, _project_env_values, _reload_env_secrets, _write_env_value_lines
 from .logs import _log
@@ -176,6 +176,25 @@ def _migrate_bot_names_cli(project_arg: str | None, args: list[str]) -> None:
     print(f'context={result.project_dir}')
     print(f'pm2={result.pm2_name}')
 
+def _migrate_bot_token_cli(project_arg: str | None, args: list[str]) -> None:
+    parser = argparse.ArgumentParser(description='Move the current project to a new Telegram bot token/username')
+    parser.add_argument('--bot-token', default='')
+    parser.add_argument('--no-start', action='store_true')
+    parser.add_argument('--preflight-only', action='store_true')
+    parsed = parser.parse_args(args)
+    token = parsed.bot_token.strip()
+    if not token:
+        print('bot token is required', file=sys.stderr)
+        sys.exit(1)
+    paths = _build_instance_paths(project_arg)
+    if parsed.preflight_only:
+        print(json.dumps(_migration_preflight(paths.project_dir, new_bot_token=token), indent=2))
+        return
+    result = _migrate_current_project_to_token(paths.project_dir, new_bot_token=token, no_start=parsed.no_start)
+    print(f'instance={result.identity.username}')
+    print(f'context={result.project_dir}')
+    print(f'pm2={result.pm2_name}')
+
 def _parse_global_cli(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('-p', '--project', default=os.environ.get('ARBOS_PROJECT') or 'default', help='Project name or path. Simple names resolve under context/<project>.')
@@ -206,6 +225,9 @@ def main() -> None:
     if remaining and remaining[0] == 'migrate-bot-names':
         _migrate_bot_names_cli(global_args.project, remaining[1:])
         return
+    if remaining and remaining[0] == 'migrate-bot-token':
+        _migrate_bot_token_cli(global_args.project, remaining[1:])
+        return
     _configure_runtime(global_args.project)
     if remaining and remaining[0] == 'send':
         _send_cli(remaining[1:])
@@ -230,7 +252,7 @@ def main() -> None:
         return
     if remaining:
         print(f'Unknown subcommand: {remaining[0]}', file=sys.stderr)
-        print('Usage: arbos [-p PROJECT] [bot-name|bootstrap-project|migrate-bot-names|send|sendfile|encrypt]', file=sys.stderr)
+        print('Usage: arbos [-p PROJECT] [bot-name|bootstrap-project|migrate-bot-names|migrate-bot-token|send|sendfile|encrypt]', file=sys.stderr)
         sys.exit(1)
     runtime_state._arbos_boot_wall = time.time()
     _operator_set('supervising', 'Arbos starting (health HTTP, agent loop, Telegram)')
